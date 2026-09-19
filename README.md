@@ -1,7 +1,9 @@
 # meetutu-backend
 
 Standalone API server for meetutu: meeting sessions, recorded audio, and
-Gemini-powered meeting intelligence (transcript, summary, action items, chat).
+LLM-powered meeting intelligence (transcript, summary, action items, chat).
+Analysis runs on **OpenRouter** with `google/gemini-3.8-flash` by default; the
+native Gemini API is still supported as a second provider.
 
 It is a drop-in replacement for the Cloudflare Worker backend — same routes,
 same response shapes, same bearer-token scheme — built to run on a small VPS.
@@ -15,8 +17,8 @@ polled a job that would never finish.
 
 Here the job is an ordinary in-process promise: it runs until it is done, its
 state is written to SQLite so a restart or a second process still sees it, and
-audio over 6 MiB is streamed to the Gemini Files API in 8 MiB chunks so the
-server never holds a whole recording in memory.
+on the Gemini path audio over 6 MiB is streamed to the Files API in 8 MiB
+chunks so the server never holds a whole recording in memory.
 
 ## How analysis works
 
@@ -36,6 +38,27 @@ decisions, action items and sentiment, with every citation pointing at a real
 second offset. Action-item assignees are speaker labels from step 1, so "who
 owns this" is a person rather than "Speaker 2". The audio is not re-sent —
 that would cost another ~230k input tokens for no extra information.
+
+Both providers run exactly these two steps — the difference is only how the
+audio reaches the model.
+
+## Providers
+
+| | OpenRouter (default) | Gemini |
+| --- | --- | --- |
+| Model default | `google/gemini-3.8-flash` | `gemini-3.6-flash` |
+| Audio delivery | base64 `input_audio` in the request body — the only form OpenRouter accepts | inline under 6 MiB, resumable Files API upload above it |
+| Key | `OPENROUTER_API_KEY` | `GEMINI_API_KEY` |
+
+`AI_PROVIDER` picks the default; a single request can override it with
+`X-AI-Provider: openrouter|gemini`. Only the default provider's key is required
+at boot, so an OpenRouter-only deploy needs no Google key at all. Whichever
+model you point a provider at **must accept audio input** — step 1 sends it the
+recording.
+
+Because OpenRouter takes audio only as base64 in the request body, the ≤15
+minute / ≤6 MiB slicing below is what keeps a request sendable; there is no
+upload-then-reference path.
 
 ## Long meetings
 
@@ -86,7 +109,7 @@ items live at the end of a meeting.
 | HTTP | Hono on `@hono/node-server` |
 | Metadata | SQLite (`better-sqlite3`), WAL mode |
 | Audio | Plain files under `DATA_DIR/audio/recordings/<session>/part-N.mp3` |
-| AI | Google Gemini (default), OpenRouter (optional) |
+| AI | OpenRouter (default), native Google Gemini |
 | Tests | vitest |
 
 Requires **Node 22+**.
@@ -95,7 +118,7 @@ Requires **Node 22+**.
 
 ```bash
 pnpm install
-cp .env.example .env    # fill in AUTH_PASSWORD and GEMINI_API_KEY
+cp .env.example .env    # fill in AUTH_PASSWORD and OPENROUTER_API_KEY
 pnpm dev                # http://localhost:8787
 ```
 
@@ -115,15 +138,16 @@ and exits with the offending name rather than 500ing on the first request.
 | --- | --- | --- | --- |
 | `AUTH_USERNAME` | yes | — | Single-user login |
 | `AUTH_PASSWORD` | yes | — | Single-user login |
-| `GEMINI_API_KEY` | yes | — | Never sent to the browser |
+| `AI_PROVIDER` | no | `openrouter` | `openrouter` or `gemini` |
+| `OPENROUTER_API_KEY` | when `AI_PROVIDER=openrouter` | — | Never sent to the browser |
+| `OPENROUTER_MODEL` | no | `google/gemini-3.8-flash` | Must accept audio input |
+| `GEMINI_API_KEY` | when `AI_PROVIDER=gemini` | — | Never sent to the browser |
 | `PORT` | no | `8787` | |
 | `HOST` | no | `0.0.0.0` | |
 | `DATA_DIR` | no | `./data` | SQLite file + audio parts |
 | `GEMINI_API_URL` | no | Google v1beta | Can point at a Cloudflare AI Gateway |
-| `GEMINI_MODEL` | no | `gemini-3.6-flash` | |
+| `GEMINI_MODEL` | no | `gemini-3.6-flash` | Must accept audio input |
 | `CF_AIG_TOKEN` | no | — | Only with an authenticated AI Gateway |
-| `OPENROUTER_API_KEY` | no | — | For `X-AI-Provider: openrouter` |
-| `OPENROUTER_MODEL` | no | `anthropic/claude-3.5-haiku` | |
 | `CORS_ORIGINS` | no | `*` | Comma-separated; narrow this in production |
 
 ## Auth
@@ -201,8 +225,9 @@ for a consistent copy while running.
 
 ## Security notes
 
-- `AUTH_PASSWORD` and `GEMINI_API_KEY` are environment-only. Keep `.env` out of
-  git (it already is) and `chmod 0640` the systemd env file.
+- `AUTH_PASSWORD`, `OPENROUTER_API_KEY` and `GEMINI_API_KEY` are
+  environment-only. Keep `.env` out of git (it already is) and `chmod 0640` the
+  systemd env file.
 - The Gemini URL and key are never taken from request headers or the body — a
   client-supplied URL would let a caller redirect the billable key to an
   endpoint of their choosing.

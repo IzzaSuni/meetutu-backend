@@ -1,10 +1,12 @@
 import {
   analyzeTranscriptWithGemini,
-  callOpenRouterAI,
+  analyzeTranscriptWithOpenRouter,
   transcribeAudioSegmentWithGemini,
+  transcribeAudioSegmentWithOpenRouter,
   uploadAudioToGeminiFiles,
   type AiAnalysisResult,
   type GeminiUploadedFile,
+  type TranscriptAnalysis,
 } from './ai-providers.js'
 import { AUDIO_CONTENT_TYPE, AUDIO_FILE_EXTENSION, UNTITLED_MEETING_TITLE } from './constants.js'
 import { findMp3FrameStart, planAudioSegments, type AudioSegment } from './segmentation.js'
@@ -172,22 +174,34 @@ function toArrayBuffer(bytes: Uint8Array): ArrayBuffer {
 }
 
 /**
- * The Gemini path, in two steps: transcribe the audio (separating and naming
- * the speakers), then analyze the resulting transcript. The model is never
- * asked to summarize straight off the audio — a summary is only ever derived
- * from a transcript that exists.
+ * What a provider has to supply for the two pipeline steps. Only the transport
+ * differs between providers — the prompts, the segmentation and the order of
+ * the steps are the same everywhere, and live in `createPipelineGenerator`.
  */
-export function createGeminiGenerator(deps: {
+interface PipelineSteps {
+  transcribeSegment(params: {
+    request: AnalysisRequest
+    bytes: Uint8Array
+    segment: AudioSegment
+    segmentCount: number
+    knownSpeakers: string[]
+    precedingContext?: string
+  }): Promise<TranscriptItem[]>
+  analyzeTranscript(params: { request: AnalysisRequest; transcript: TranscriptItem[] }): Promise<TranscriptAnalysis>
+}
+
+/**
+ * The pipeline, in two steps: transcribe the audio (separating and naming the
+ * speakers), then analyze the resulting transcript. The model is never asked
+ * to summarize straight off the audio — a summary is only ever derived from a
+ * transcript that exists.
+ */
+function createPipelineGenerator(deps: {
   audio: AudioStorage
-  apiKey: string
-  apiUrl?: string
-  cfAigToken?: string
-  inlineMaxBytes?: number
+  steps: PipelineSteps
   maxSegmentSeconds?: number
   maxSegmentBytes?: number
 }): AnalysisGenerator {
-  const inlineMaxBytes = deps.inlineMaxBytes ?? GEMINI_INLINE_AUDIO_MAX_BYTES
-
   return async (request, hooks = {}) => {
     const layout = await deps.audio.getLayout(request.sessionId)
     if (!layout) {
@@ -204,7 +218,14 @@ export function createGeminiGenerator(deps: {
       throw new Error('The recording for this session is empty.')
     }
 
-    const transcript = await transcribeRecording({ deps, inlineMaxBytes, layout, segments, request, hooks })
+    const transcript = await transcribeRecording({
+      audio: deps.audio,
+      steps: deps.steps,
+      layout,
+      segments,
+      request,
+      hooks,
+    })
 
     hooks.onProgress?.({
       stage: 'analyzing',
@@ -212,19 +233,126 @@ export function createGeminiGenerator(deps: {
       totalSegments: segments.length,
     })
 
-    const { summary, suggestedTitle } = await analyzeTranscriptWithGemini({
-      apiUrl: deps.apiUrl,
-      apiKey: deps.apiKey,
-      model: request.model,
-      cfAigToken: deps.cfAigToken,
-      title: request.title,
-      durationSeconds: request.durationSeconds,
-      transcript,
-      customInstructions: request.customInstructions,
-    })
-
+    const { summary, suggestedTitle } = await deps.steps.analyzeTranscript({ request, transcript })
     return { transcript, summary, suggestedTitle }
   }
+}
+
+/** The Gemini path: audio goes to Google directly, large slices via the Files API. */
+export function createGeminiGenerator(deps: {
+  audio: AudioStorage
+  apiKey: string
+  apiUrl?: string
+  cfAigToken?: string
+  inlineMaxBytes?: number
+  maxSegmentSeconds?: number
+  maxSegmentBytes?: number
+}): AnalysisGenerator {
+  const inlineMaxBytes = deps.inlineMaxBytes ?? GEMINI_INLINE_AUDIO_MAX_BYTES
+
+  return createPipelineGenerator({
+    audio: deps.audio,
+    maxSegmentSeconds: deps.maxSegmentSeconds,
+    maxSegmentBytes: deps.maxSegmentBytes,
+    steps: {
+      async transcribeSegment({ request, bytes, segment, segmentCount, knownSpeakers, precedingContext }) {
+        // Inlining costs roughly 4x the slice size in peak memory (raw bytes +
+        // base64 + JSON body), so anything large is streamed off disk into the
+        // Files API instead and referenced by URI.
+        let audioFile: GeminiUploadedFile | undefined
+        let audioBuffer: ArrayBuffer | undefined
+        if (bytes.byteLength > inlineMaxBytes) {
+          const slice = toArrayBuffer(bytes)
+          audioFile = await uploadAudioToGeminiFiles({
+            apiKey: deps.apiKey,
+            cfAigToken: deps.cfAigToken,
+            byteLength: slice.byteLength,
+            mimeType: AUDIO_CONTENT_TYPE,
+            displayName: `meetutu-session-${request.sessionId}-part-${segment.index + 1}.${AUDIO_FILE_EXTENSION}`,
+            readChunk: async (offset, length) => new Uint8Array(slice, offset, length),
+          })
+        } else {
+          audioBuffer = toArrayBuffer(bytes)
+        }
+
+        return transcribeAudioSegmentWithGemini({
+          apiUrl: deps.apiUrl,
+          apiKey: deps.apiKey,
+          model: request.model,
+          cfAigToken: deps.cfAigToken,
+          audioBuffer,
+          audioFile,
+          segment,
+          segmentCount,
+          knownSpeakers,
+          precedingContext,
+          customInstructions: request.customInstructions,
+        })
+      },
+
+      analyzeTranscript: ({ request, transcript }) =>
+        analyzeTranscriptWithGemini({
+          apiUrl: deps.apiUrl,
+          apiKey: deps.apiKey,
+          model: request.model,
+          cfAigToken: deps.cfAigToken,
+          title: request.title,
+          durationSeconds: request.durationSeconds,
+          transcript,
+          customInstructions: request.customInstructions,
+        }),
+    },
+  })
+}
+
+/**
+ * The OpenRouter path. Same two steps, but every slice travels inline as
+ * base64: OpenRouter takes audio only in the request body, so there is no
+ * upload threshold to cross and the segment byte cap is what keeps a request
+ * sendable.
+ *
+ * The key is per request rather than per process — a client may supply its own.
+ */
+export function createOpenRouterGenerator(deps: {
+  audio: AudioStorage
+  maxSegmentSeconds?: number
+  maxSegmentBytes?: number
+}): AnalysisGenerator {
+  function keyFor(request: AnalysisRequest): string {
+    if (!request.openrouterKey) {
+      throw new Error('No OpenRouter API key configured.')
+    }
+    return request.openrouterKey
+  }
+
+  return createPipelineGenerator({
+    audio: deps.audio,
+    maxSegmentSeconds: deps.maxSegmentSeconds,
+    maxSegmentBytes: deps.maxSegmentBytes,
+    steps: {
+      transcribeSegment: ({ request, bytes, segment, segmentCount, knownSpeakers, precedingContext }) =>
+        transcribeAudioSegmentWithOpenRouter({
+          apiKey: keyFor(request),
+          model: request.model,
+          audioBuffer: toArrayBuffer(bytes),
+          segment,
+          segmentCount,
+          knownSpeakers,
+          precedingContext,
+          customInstructions: request.customInstructions,
+        }),
+
+      analyzeTranscript: ({ request, transcript }) =>
+        analyzeTranscriptWithOpenRouter({
+          apiKey: keyFor(request),
+          model: request.model,
+          title: request.title,
+          durationSeconds: request.durationSeconds,
+          transcript,
+          customInstructions: request.customInstructions,
+        }),
+    },
+  })
 }
 
 /** How many trailing lines of the previous segment to show the model for continuity. */
@@ -247,56 +375,35 @@ function renderContinuity(transcript: TranscriptItem[]): string | undefined {
  * the whole meeting instead of becoming "Speaker 1" again in every part.
  */
 async function transcribeRecording(params: {
-  deps: { audio: AudioStorage; apiKey: string; apiUrl?: string; cfAigToken?: string }
-  inlineMaxBytes: number
+  audio: AudioStorage
+  steps: PipelineSteps
   layout: Awaited<ReturnType<AudioStorage['getLayout']>>
   segments: AudioSegment[]
   request: AnalysisRequest
   hooks: AnalysisHooks
 }): Promise<TranscriptItem[]> {
-  const { deps, layout, segments, request, hooks } = params
+  const { audio, steps, layout, segments, request, hooks } = params
   if (!layout) throw new Error('No audio recording found for this session yet.')
 
   const transcript: TranscriptItem[] = []
   const speakers: string[] = []
 
   for (const segment of segments) {
-    const raw = await deps.audio.readRange(layout, segment.byteOffset, segment.byteLength)
+    const raw = await audio.readRange(layout, segment.byteOffset, segment.byteLength)
     // A byte-boundary cut lands mid-frame; drop the partial frame at the front
-    // so the decoder on Google's side starts cleanly. The first segment starts
-    // at the real beginning of the file and is left alone.
+    // so the decoder on the provider's side starts cleanly. The first segment
+    // starts at the real beginning of the file and is left alone.
     const bytes = segment.index === 0 ? raw : raw.subarray(findMp3FrameStart(raw))
 
-    let audioFile: GeminiUploadedFile | undefined
-    let audioBuffer: ArrayBuffer | undefined
-    if (bytes.byteLength > params.inlineMaxBytes) {
-      const slice = toArrayBuffer(bytes)
-      audioFile = await uploadAudioToGeminiFiles({
-        apiKey: deps.apiKey,
-        cfAigToken: deps.cfAigToken,
-        byteLength: slice.byteLength,
-        mimeType: AUDIO_CONTENT_TYPE,
-        displayName: `meetutu-session-${request.sessionId}-part-${segment.index + 1}.${AUDIO_FILE_EXTENSION}`,
-        readChunk: async (offset, length) => new Uint8Array(slice, offset, length),
-      })
-    } else {
-      audioBuffer = toArrayBuffer(bytes)
-    }
-
-    // Say which part failed: with eight of them, "Gemini API error (403)" on
-    // its own leaves no way to tell a transient blip from a bad slice.
-    const items = await transcribeAudioSegmentWithGemini({
-      apiUrl: deps.apiUrl,
-      apiKey: deps.apiKey,
-      model: request.model,
-      cfAigToken: deps.cfAigToken,
-      audioBuffer,
-      audioFile,
+    // Say which part failed: with eight of them, "API error (403)" on its own
+    // leaves no way to tell a transient blip from a bad slice.
+    const items = await steps.transcribeSegment({
+      request,
+      bytes,
       segment,
       segmentCount: segments.length,
       knownSpeakers: speakers,
       precedingContext: renderContinuity(transcript),
-      customInstructions: request.customInstructions,
     }).catch((error: unknown) => {
       const message = error instanceof Error ? error.message : String(error)
       throw new Error(
@@ -322,25 +429,22 @@ async function transcribeRecording(params: {
 
 /** Dispatches to the provider the request asked for. */
 export function createGenerator(deps: { audio: AudioStorage; config: Config }): AnalysisGenerator {
+  const openrouter = createOpenRouterGenerator({ audio: deps.audio })
   const gemini = createGeminiGenerator({
     audio: deps.audio,
-    apiKey: deps.config.geminiApiKey,
+    // Checked per request instead of at construction: a Gemini key is optional
+    // on an OpenRouter-only deploy.
+    apiKey: deps.config.geminiApiKey ?? '',
     apiUrl: deps.config.geminiApiUrl,
     cfAigToken: deps.config.cfAigToken,
   })
 
   return async (request, hooks) => {
     if (request.kind === 'openrouter') {
-      if (!request.openrouterKey) {
-        throw new Error('No OpenRouter API key configured.')
-      }
-      return callOpenRouterAI({
-        apiKey: request.openrouterKey,
-        model: request.model,
-        title: request.title,
-        durationSeconds: request.durationSeconds,
-        customInstructions: request.customInstructions,
-      })
+      return openrouter(request, hooks)
+    }
+    if (!deps.config.geminiApiKey) {
+      throw new Error('No Gemini API key configured.')
     }
     return gemini(request, hooks)
   }

@@ -18,9 +18,11 @@ const config: Config = {
   dataDir: '.',
   authUsername: 'admin',
   authPassword: 'secret',
+  aiProvider: 'gemini',
   geminiApiKey: 'gemini-key',
   geminiApiUrl: 'https://gemini.test/v1beta',
   geminiModel: 'gemini-3.6-flash',
+  openrouterModel: 'google/gemini-3.8-flash',
   corsOrigins: ['*'],
 }
 
@@ -345,6 +347,7 @@ describe('meetutu backend app', () => {
 
     it('rejects an OpenRouter run with no key configured', async () => {
       await createSession()
+      await audio.putPart(1, 1, new Uint8Array([1]))
       const res = await app.request('/api/recordings/1/transcribe', {
         method: 'POST',
         headers: { ...json, 'X-AI-Provider': 'openrouter' },

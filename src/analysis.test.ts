@@ -5,7 +5,13 @@ import { join } from 'node:path'
 import { openDatabase } from './db.js'
 import { createStorage, type Storage } from './storage.js'
 import { createAudioStorage, type AudioStorage } from './audio-storage.js'
-import { createAnalysisRunner, createGeminiGenerator, createGenerator, type AnalysisRequest } from './analysis.js'
+import {
+  createAnalysisRunner,
+  createGeminiGenerator,
+  createGenerator,
+  createOpenRouterGenerator,
+  type AnalysisRequest,
+} from './analysis.js'
 import { UNTITLED_MEETING_TITLE } from './constants.js'
 import type { MeetingSession } from './types.js'
 
@@ -254,14 +260,18 @@ describe('gemini generator', () => {
 
   it('dispatches an openrouter request to OpenRouter, not Gemini', async () => {
     const calledUrls: string[] = []
-    globalThis.fetch = vi.fn(async (url: string | URL) => {
+    globalThis.fetch = vi.fn(async (url: string | URL, init?: RequestInit) => {
       calledUrls.push(String(url))
+      const sentAudio = String(init?.body).includes('input_audio')
       return new Response(
         JSON.stringify({
           choices: [
             {
+              finish_reason: 'stop',
               message: {
-                content: JSON.stringify({ transcript: aiResult.transcript, summary: aiResult.summary }),
+                content: JSON.stringify(
+                  sentAudio ? { transcript: aiResult.transcript } : { summary: aiResult.summary }
+                ),
               },
             },
           ],
@@ -270,6 +280,7 @@ describe('gemini generator', () => {
       )
     }) as unknown as typeof fetch
 
+    await audio.putPart(1, 1, new Uint8Array([1, 2, 3, 4]))
     const generate = createGenerator({
       audio,
       config: {
@@ -278,19 +289,105 @@ describe('gemini generator', () => {
         dataDir: '.',
         authUsername: 'admin',
         authPassword: 'secret',
+        aiProvider: 'openrouter',
         geminiApiKey: 'gemini-key',
         geminiApiUrl: 'https://gemini.test/v1beta',
         geminiModel: 'gemini-3.6-flash',
+        openrouterModel: 'google/gemini-3.8-flash',
         corsOrigins: ['*'],
       },
     })
 
     const result = await generate(
-      request({ kind: 'openrouter', model: 'anthropic/claude-3.5-haiku', openrouterKey: 'or-key' })
+      request({ kind: 'openrouter', model: 'google/gemini-3.8-flash', openrouterKey: 'or-key' })
     )
 
-    expect(calledUrls[0]).toContain('openrouter.ai')
+    expect(calledUrls.every((url) => url.includes('openrouter.ai'))).toBe(true)
     expect(result.transcript).toHaveLength(1)
+    expect(result.summary.overview).toBe('A sync.')
+  })
+})
+
+describe('openrouter generator', () => {
+  let dir: string
+  let audio: AudioStorage
+  const originalFetch = globalThis.fetch
+
+  beforeEach(() => {
+    dir = mkdtempSync(join(tmpdir(), 'meetutu-openrouter-'))
+    audio = createAudioStorage(join(dir, 'audio'))
+  })
+
+  afterEach(() => {
+    globalThis.fetch = originalFetch
+    rmSync(dir, { recursive: true, force: true })
+  })
+
+  const orOk = (payload: unknown) =>
+    new Response(JSON.stringify({ choices: [{ finish_reason: 'stop', message: { content: JSON.stringify(payload) } }] }), {
+      status: 200,
+      headers: { 'Content-Type': 'application/json' },
+    })
+
+  it('transcribes every segment then analyzes the merged transcript', async () => {
+    // Arrange: four 15-minute segments' worth of audio, scaled down 1000x.
+    const bodies: any[] = []
+    globalThis.fetch = vi.fn(async (_url: string | URL, init?: RequestInit) => {
+      const body = JSON.parse(String(init?.body))
+      bodies.push(body)
+      const sentAudio = JSON.stringify(body).includes('input_audio')
+      return orOk(
+        sentAudio
+          ? { transcript: [{ id: 't-1', timestamp: '00:01', seconds: 1, speaker: 'Andi (Host)', text: 'Hi.' }] }
+          : { summary: aiResult.summary, suggested_title: 'Weekly Sync' }
+      )
+    }) as unknown as typeof fetch
+
+    const bytes = new Uint8Array(1440)
+    for (let i = 0; i < bytes.length; i += 360) {
+      bytes[i] = 0xff
+      bytes[i + 1] = 0xfb
+    }
+    await audio.putPart(1, 1, bytes)
+
+    const generate = createOpenRouterGenerator({ audio, maxSegmentSeconds: 900, maxSegmentBytes: 360 })
+
+    // Act
+    const result = await generate(
+      request({ kind: 'openrouter', model: 'google/gemini-3.8-flash', openrouterKey: 'or-key', durationSeconds: 3600 })
+    )
+
+    // Assert: four transcription calls with audio, then one text-only analysis.
+    const withAudio = bodies.filter((body) => JSON.stringify(body).includes('input_audio'))
+    expect(withAudio).toHaveLength(4)
+    expect(JSON.stringify(bodies[bodies.length - 1])).not.toContain('input_audio')
+    expect(result.transcript).toHaveLength(4)
+    expect(result.suggestedTitle).toBe('Weekly Sync')
+  })
+
+  it('reports progress through both stages', async () => {
+    globalThis.fetch = vi.fn(async (_url: string | URL, init?: RequestInit) =>
+      String(init?.body).includes('input_audio')
+        ? orOk({ transcript: [] })
+        : orOk({ summary: aiResult.summary })
+    ) as unknown as typeof fetch
+
+    await audio.putPart(1, 1, new Uint8Array([0xff, 0xfb, 0, 0]))
+    const generate = createOpenRouterGenerator({ audio })
+    const stages: string[] = []
+
+    await generate(request({ kind: 'openrouter', openrouterKey: 'or-key' }), {
+      onProgress: (progress) => stages.push(progress.stage),
+    })
+
+    expect(stages).toEqual(['transcribing', 'analyzing'])
+  })
+
+  it('fails clearly when no OpenRouter key was supplied', async () => {
+    await audio.putPart(1, 1, new Uint8Array([1, 2, 3, 4]))
+    const generate = createOpenRouterGenerator({ audio })
+
+    await expect(generate(request({ kind: 'openrouter' }))).rejects.toThrow(/OpenRouter API key/i)
   })
 })
 

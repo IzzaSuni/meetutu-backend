@@ -1,11 +1,14 @@
 import { describe, it, expect, vi, afterEach } from 'vitest'
 import {
+  DEFAULT_OPENROUTER_MODEL,
   GEMINI_MAX_OUTPUT_TOKENS,
   GEMINI_UPLOAD_CHUNK_BYTES,
   analyzeTranscriptWithGemini,
+  analyzeTranscriptWithOpenRouter,
   callGeminiChat,
   fetchGeminiWithRetry,
   transcribeAudioSegmentWithGemini,
+  transcribeAudioSegmentWithOpenRouter,
   uploadAudioToGeminiFiles,
 } from './ai-providers.js'
 
@@ -492,6 +495,166 @@ describe('analyzeTranscriptWithGemini', () => {
 
     await expect(
       analyzeTranscriptWithGemini({ apiKey: 'k', title: 'Sync', durationSeconds: 60, transcript }),
+    ).rejects.toThrow(/summary/i)
+  })
+})
+
+function openRouterMessage(payload: unknown, finishReason = 'stop') {
+  return { choices: [{ finish_reason: finishReason, message: { content: JSON.stringify(payload) } }] }
+}
+
+describe('transcribeAudioSegmentWithOpenRouter', () => {
+  const SEGMENT = { index: 0, byteOffset: 0, byteLength: 3, startSeconds: 0, durationSeconds: 900 }
+  const TRANSCRIPT_ONLY = {
+    transcript: [{ id: 't-1', timestamp: '00:02', seconds: 2, speaker: 'Andi (Host)', text: 'Hello.' }],
+  }
+
+  it('defaults to a model that can actually hear audio', () => {
+    expect(DEFAULT_OPENROUTER_MODEL).toBe('google/gemini-3.8-flash')
+  })
+
+  it('sends the audio inline as a base64 input_audio part', async () => {
+    // Arrange: OpenRouter has no files API — audio has to travel in the body.
+    let body: any
+    const fetchMock = vi.fn(async (_url: string | URL, init?: RequestInit) => {
+      body = JSON.parse(String(init?.body))
+      return jsonResponse(openRouterMessage(TRANSCRIPT_ONLY))
+    })
+    globalThis.fetch = fetchMock as unknown as typeof fetch
+
+    // Act
+    const items = await transcribeAudioSegmentWithOpenRouter({
+      apiKey: 'or-key',
+      audioBuffer: new Uint8Array([1, 2, 3]).buffer,
+      segment: SEGMENT,
+      segmentCount: 1,
+    })
+
+    // Assert
+    expect(String(fetchMock.mock.calls[0][0])).toContain('openrouter.ai')
+    const parts = body.messages[0].content
+    expect(parts.find((p: any) => p.type === 'input_audio').input_audio).toEqual({
+      data: Buffer.from([1, 2, 3]).toString('base64'),
+      format: 'mp3',
+    })
+    expect(items[0].speaker).toBe('Andi (Host)')
+  })
+
+  it('asks for the same speaker identification as the Gemini path', async () => {
+    let body: any
+    globalThis.fetch = vi.fn(async (_url: string | URL, init?: RequestInit) => {
+      body = JSON.parse(String(init?.body))
+      return jsonResponse(openRouterMessage({ transcript: [] }))
+    }) as unknown as typeof fetch
+
+    await transcribeAudioSegmentWithOpenRouter({
+      apiKey: 'or-key',
+      audioBuffer: new Uint8Array([1]).buffer,
+      segment: { ...SEGMENT, index: 1, startSeconds: 900 },
+      segmentCount: 2,
+      knownSpeakers: ['Dewi (Finance)'],
+      precedingContext: '[14:45] Dewi (Finance): so about the budget—',
+    })
+
+    const prompt = body.messages[0].content.find((p: any) => p.type === 'text').text
+    expect(prompt).toMatch(/real name/i)
+    expect(prompt).toMatch(/never invent a name/i)
+    expect(prompt).toContain('Dewi (Finance)')
+    expect(prompt).toContain('so about the budget—')
+  })
+
+  it('shifts segment timestamps into meeting time', async () => {
+    globalThis.fetch = vi.fn(async () => jsonResponse(openRouterMessage(TRANSCRIPT_ONLY))) as unknown as typeof fetch
+
+    const items = await transcribeAudioSegmentWithOpenRouter({
+      apiKey: 'or-key',
+      audioBuffer: new Uint8Array([1]).buffer,
+      segment: { ...SEGMENT, index: 7, startSeconds: 6300 },
+      segmentCount: 8,
+    })
+
+    expect(items[0]).toMatchObject({ id: 't-8-1', seconds: 6302, timestamp: '105:02' })
+  })
+
+  it('reports a response cut off at the output limit', async () => {
+    globalThis.fetch = vi.fn(async () =>
+      jsonResponse({ choices: [{ finish_reason: 'length', message: { content: '{"transcript":[{"id"' } }] }),
+    ) as unknown as typeof fetch
+
+    await expect(
+      transcribeAudioSegmentWithOpenRouter({
+        apiKey: 'or-key',
+        audioBuffer: new Uint8Array([1]).buffer,
+        segment: SEGMENT,
+        segmentCount: 8,
+      }),
+    ).rejects.toThrow(/output limit/i)
+  })
+
+  it('surfaces an error that OpenRouter returned with HTTP 200', async () => {
+    // Arrange: a provider-side failure arrives in the body, not the status.
+    globalThis.fetch = vi.fn(async () =>
+      jsonResponse({ error: { code: 429, message: 'Provider rate limit' } }),
+    ) as unknown as typeof fetch
+
+    await expect(
+      transcribeAudioSegmentWithOpenRouter({
+        apiKey: 'or-key',
+        audioBuffer: new Uint8Array([1]).buffer,
+        segment: SEGMENT,
+        segmentCount: 1,
+      }),
+    ).rejects.toThrow(/Provider rate limit/)
+  })
+
+  it('refuses to transcribe without audio rather than inventing a transcript', async () => {
+    const fetchMock = vi.fn()
+    globalThis.fetch = fetchMock as unknown as typeof fetch
+
+    await expect(
+      transcribeAudioSegmentWithOpenRouter({ apiKey: 'or-key', segment: SEGMENT, segmentCount: 1 }),
+    ).rejects.toThrow(/audio/i)
+    expect(fetchMock).not.toHaveBeenCalled()
+  })
+})
+
+describe('analyzeTranscriptWithOpenRouter', () => {
+  const transcript = [{ id: 't-1', timestamp: '00:00', seconds: 0, speaker: 'Andi (Host)', text: 'Ship on Friday.' }]
+
+  it('analyzes transcript text without re-sending the audio', async () => {
+    let sent = ''
+    const fetchMock = vi.fn(async (_url: string | URL, init?: RequestInit) => {
+      sent = String(init?.body)
+      return jsonResponse(
+        openRouterMessage({
+          summary: { overview: 'Ship talk.', key_points: [], action_items: [], decisions: [], sentiment: 'Positive' },
+          suggested_title: 'Ship Decision',
+        }),
+      )
+    })
+    globalThis.fetch = fetchMock as unknown as typeof fetch
+
+    const result = await analyzeTranscriptWithOpenRouter({
+      apiKey: 'or-key',
+      title: '',
+      durationSeconds: 7200,
+      transcript,
+    })
+
+    expect(result.summary.overview).toBe('Ship talk.')
+    expect(result.suggestedTitle).toBe('Ship Decision')
+    const body = sent
+    expect(body).toContain('Ship on Friday.')
+    expect(body).not.toContain('input_audio')
+  })
+
+  it('rejects a response with no summary object', async () => {
+    globalThis.fetch = vi.fn(async () =>
+      jsonResponse(openRouterMessage({ suggested_title: 'Only a title' })),
+    ) as unknown as typeof fetch
+
+    await expect(
+      analyzeTranscriptWithOpenRouter({ apiKey: 'or-key', title: 'Sync', durationSeconds: 60, transcript }),
     ).rejects.toThrow(/summary/i)
   })
 })

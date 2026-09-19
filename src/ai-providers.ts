@@ -1,4 +1,4 @@
-import { UNTITLED_MEETING_TITLE } from './constants.js'
+import { AUDIO_FILE_EXTENSION, UNTITLED_MEETING_TITLE } from './constants.js'
 import type { AudioSegment } from './segmentation.js'
 import type { ChatTurn, MeetingSummary, TranscriptItem } from './types.js'
 
@@ -6,7 +6,13 @@ import type { ChatTurn, MeetingSummary, TranscriptItem } from './types.js'
 // The API key comes from the environment, never from the browser.
 export const DEFAULT_GEMINI_API_URL = 'https://generativelanguage.googleapis.com/v1beta'
 export const DEFAULT_GEMINI_MODEL = 'gemini-3.6-flash'
-export const DEFAULT_OPENROUTER_MODEL = 'anthropic/claude-3.5-haiku'
+/**
+ * Whatever model this points at must accept audio input: the first step of the
+ * pipeline sends it the recording. Gemini 3.8 Flash takes text/image/audio/
+ * video, with the same 1M-token context and 65,536-token output ceiling as the
+ * native Gemini path assumes.
+ */
+export const DEFAULT_OPENROUTER_MODEL = 'google/gemini-3.8-flash'
 
 const OPENROUTER_CHAT_URL = 'https://openrouter.ai/api/v1/chat/completions'
 const OPENROUTER_APP_TITLE = 'meetutu meeting recorder'
@@ -63,7 +69,79 @@ function formatTimestamp(totalSeconds: number): string {
 }
 
 interface OpenRouterResponse {
-  choices?: Array<{ message?: { content?: string } }>
+  choices?: Array<{ message?: { content?: string }; finish_reason?: string }>
+  /** OpenRouter reports some provider-side failures in a 200 body rather than the status. */
+  error?: { code?: number; message?: string }
+}
+
+/**
+ * Pulls the text out of a completion, turning a truncated, blocked or
+ * body-reported failure into a clear error rather than an unexplained
+ * `JSON.parse` failure minutes into a long job. Mirrors `readGeminiText`.
+ */
+function readOpenRouterText(json: OpenRouterResponse, what: string): string {
+  if (json.error?.message) {
+    throw new Error(`OpenRouter error while ${what}: ${json.error.message}`)
+  }
+
+  const choice = json.choices?.[0]
+  if (choice?.finish_reason === 'length') {
+    throw new Error(
+      `OpenRouter hit its output limit while ${what}, so the response was cut off. The recording is too long to return in one piece.`,
+    )
+  }
+
+  const content = choice?.message?.content
+  if (!content) {
+    throw new Error(
+      choice?.finish_reason
+        ? `Empty response from OpenRouter while ${what} (finish_reason: ${choice.finish_reason})`
+        : 'Empty response from OpenRouter AI',
+    )
+  }
+  return content
+}
+
+type OpenRouterContentPart =
+  | { type: 'text'; text: string }
+  | { type: 'input_audio'; input_audio: { data: string; format: string } }
+
+/**
+ * One JSON-returning completion. `max_tokens` is deliberately left unset: the
+ * ceiling differs per model, and asking for more than a model allows is an
+ * outright 400 — omitting it gives the provider default, which is the model's
+ * own maximum. Truncation is caught by `finish_reason` instead.
+ */
+async function requestOpenRouterJson(params: {
+  apiKey: string
+  model: string
+  content: OpenRouterContentPart[] | string
+  what: string
+}): Promise<string> {
+  const res = await fetchWithRetry(
+    OPENROUTER_CHAT_URL,
+    {
+      method: 'POST',
+      headers: buildOpenRouterHeaders(params.apiKey),
+      body: JSON.stringify({
+        model: params.model,
+        messages: [{ role: 'user', content: params.content }],
+        response_format: { type: 'json_object' },
+      }),
+    },
+    'OpenRouter API',
+  )
+
+  return readOpenRouterText((await res.json()) as OpenRouterResponse, params.what)
+}
+
+function buildOpenRouterHeaders(apiKey: string): Record<string, string> {
+  return {
+    Authorization: `Bearer ${apiKey}`,
+    'HTTP-Referer': OPENROUTER_APP_URL,
+    'X-Title': OPENROUTER_APP_TITLE,
+    'Content-Type': 'application/json',
+  }
 }
 
 // When GEMINI_API_URL is repointed at a Cloudflare AI Gateway
@@ -78,36 +156,45 @@ function buildGeminiHeaders(apiKey: string, cfAigToken?: string): Record<string,
   }
 }
 
-const GEMINI_RETRYABLE_STATUS = new Set([429, 500, 502, 503])
-const GEMINI_MAX_RETRIES = 2
-const GEMINI_RETRY_BASE_DELAY_MS = 400
+const RETRYABLE_STATUS = new Set([429, 500, 502, 503])
+const MAX_RETRIES = 2
+const RETRY_BASE_DELAY_MS = 400
 
 // Google's Generative Language API occasionally answers a perfectly valid
 // request with "User location is not supported" (FAILED_PRECONDITION, HTTP
 // 400) depending on the egress path, then succeeds on an immediate retry. A
 // short retry rides that out instead of surfacing a one-off transient failure
 // as if the account were permanently blocked.
-function isRetryableGeminiError(status: number, errorText: string): boolean {
-  if (GEMINI_RETRYABLE_STATUS.has(status)) return true
+function isGeminiLocationBlip(status: number, errorText: string): boolean {
   return status === 400 && errorText.includes('FAILED_PRECONDITION')
 }
 
 const sleep = (ms: number) => new Promise((resolve) => setTimeout(resolve, ms))
 
-export async function fetchGeminiWithRetry(url: string, init: RequestInit): Promise<Response> {
-  for (let attempt = 0; attempt <= GEMINI_MAX_RETRIES; attempt++) {
+async function fetchWithRetry(
+  url: string,
+  init: RequestInit,
+  label: string,
+  alsoRetryable?: (status: number, errorText: string) => boolean,
+): Promise<Response> {
+  for (let attempt = 0; attempt <= MAX_RETRIES; attempt++) {
     const res = await fetch(url, init)
     if (res.ok) return res
 
     const errorText = await res.text()
-    if (attempt < GEMINI_MAX_RETRIES && isRetryableGeminiError(res.status, errorText)) {
-      await sleep(GEMINI_RETRY_BASE_DELAY_MS * (attempt + 1))
+    const retryable = RETRYABLE_STATUS.has(res.status) || (alsoRetryable?.(res.status, errorText) ?? false)
+    if (attempt < MAX_RETRIES && retryable) {
+      await sleep(RETRY_BASE_DELAY_MS * (attempt + 1))
       continue
     }
-    throw new Error(`Gemini API error (${res.status}): ${errorText}`)
+    throw new Error(`${label} error (${res.status}): ${errorText}`)
   }
   // Unreachable — the loop above always either returns or throws.
-  throw new Error('Gemini API error: exhausted retries')
+  throw new Error(`${label} error: exhausted retries`)
+}
+
+export async function fetchGeminiWithRetry(url: string, init: RequestInit): Promise<Response> {
+  return fetchWithRetry(url, init, 'Gemini API', isGeminiLocationBlip)
 }
 
 /**
@@ -281,122 +368,7 @@ function stripCodeFence(rawText: string): string {
   return raw.replace(/^```(?:json)?\n?/, '').replace(/\n?```$/, '')
 }
 
-function buildAnalysisPrompt(params: {
-  title: string
-  durationSeconds: number
-  hasAudio: boolean
-  needsGeneratedTitle: boolean
-  customInstructions?: string
-}): string {
-  return `You are meetutu AI, a world-class executive meeting intelligence engine.
-${params.hasAudio ? 'Listen to this recorded audio file and transcribe all spoken dialogue verbatim.' : 'Analyze this meeting session.'}
-Generate:
-1. Detailed chronological dialogue transcript segments with timestamps (e.g. "00:00", "00:15") and realistic speaker labels (e.g. "Speaker 1 (Host)", "Speaker 2 (Participant)").
-2. A structured executive meeting summary with:
-${SUMMARY_FIELDS_SPEC}
-Every "seconds" value (in transcript and in summary timestamps) MUST be the actual integer second offset into the recording, and every "timestamp" string MUST be the matching "MM:SS" formatting of that same value.
-${params.needsGeneratedTitle ? '3. A concise, specific meeting title (3-8 words) summarizing what was actually discussed — no generic placeholders.' : ''}
-${params.customInstructions ? `\nThe user has given you these additional instructions for how to generate this summary — follow them closely, adjusting tone/focus/language/structure as asked, while still returning the exact JSON schema below:\n"""\n${params.customInstructions}\n"""\n` : ''}
-
-Meeting Title: ${params.title || '(not provided — generate one from the actual content)'}
-Duration: ${params.durationSeconds || 30} seconds
-
-You MUST return ONLY a JSON object matching this exact schema:
-{
-  "transcript": [
-    { "id": "t-1", "timestamp": "00:00", "seconds": 0, "speaker": "Speaker 1 (Host)", "text": "..." }
-  ],
-${SUMMARY_JSON_SCHEMA}${params.needsGeneratedTitle ? ',\n  "suggested_title": "..."' : ''}
-}`
-}
-
-function parseAnalysisJson(rawText: string, source: 'Gemini' | 'OpenRouter'): AiAnalysisResult {
-  const parsed = JSON.parse(stripCodeFence(rawText))
-  if (!parsed.transcript || !parsed.summary) {
-    throw new Error(`${source} response did not match expected transcript/summary format`)
-  }
-
-  return {
-    transcript: parsed.transcript,
-    summary: parsed.summary,
-    suggestedTitle: parsed.suggested_title,
-  }
-}
-
-export async function callOpenRouterAI(params: {
-  apiKey: string
-  model?: string
-  title: string
-  durationSeconds: number
-  customInstructions?: string
-}): Promise<AiAnalysisResult> {
-  const model = params.model || DEFAULT_OPENROUTER_MODEL
-  const needsGeneratedTitle = !params.title || params.title === UNTITLED_MEETING_TITLE
-
-  const systemPrompt = buildAnalysisPrompt({
-    title: params.title,
-    durationSeconds: params.durationSeconds,
-    hasAudio: false,
-    needsGeneratedTitle,
-    customInstructions: params.customInstructions,
-  })
-
-  const userPrompt = `Meeting Title: ${params.title || '(not provided — generate one from the actual content)'}
-Duration: ${params.durationSeconds || 30} seconds
-Please generate the comprehensive transcript and executive meeting summary according to the schema.`
-
-  const res = await fetch(OPENROUTER_CHAT_URL, {
-    method: 'POST',
-    headers: {
-      Authorization: `Bearer ${params.apiKey}`,
-      'HTTP-Referer': OPENROUTER_APP_URL,
-      'X-Title': OPENROUTER_APP_TITLE,
-      'Content-Type': 'application/json',
-    },
-    body: JSON.stringify({
-      model,
-      messages: [
-        { role: 'system', content: systemPrompt },
-        { role: 'user', content: userPrompt },
-      ],
-      response_format: { type: 'json_object' },
-      temperature: 0.2,
-    }),
-  })
-
-  if (!res.ok) {
-    throw new Error(`OpenRouter API error (${res.status}): ${await res.text()}`)
-  }
-
-  const data = (await res.json()) as OpenRouterResponse
-  const content = data.choices?.[0]?.message?.content
-  if (!content) {
-    throw new Error('Empty response from OpenRouter AI')
-  }
-
-  return parseAnalysisJson(content, 'OpenRouter')
-}
-
-/**
- * Step 1 of the pipeline: turn audio into a speaker-attributed transcript.
- *
- * This is the only call that ever hears the recording. It transcribes one
- * slice of it — a 90-120 minute meeting does not fit in one response (see
- * segmentation.ts) — separates the voices, and names them where the audio
- * says who they are.
- *
- * The model only hears this slice, so it numbers its timestamps from zero and
- * knows nothing about who spoke earlier; timestamps are shifted back into
- * meeting time here, and `knownSpeakers`/`precedingContext` carry the identity
- * of the people already found into the next slice.
- */
-export async function transcribeAudioSegmentWithGemini(params: {
-  apiUrl?: string
-  apiKey: string
-  model?: string
-  cfAigToken?: string
-  audioBuffer?: ArrayBuffer
-  audioFile?: GeminiUploadedFile
+export interface TranscriptionSegmentParams {
   segment: AudioSegment
   segmentCount: number
   /** Speaker labels already established in earlier segments of this meeting. */
@@ -404,15 +376,21 @@ export async function transcribeAudioSegmentWithGemini(params: {
   /** The last few transcript lines before this slice, for continuity across the cut. */
   precedingContext?: string
   customInstructions?: string
-}): Promise<TranscriptItem[]> {
-  const baseUrl = (params.apiUrl || DEFAULT_GEMINI_API_URL).replace(/\/$/, '')
-  const model = params.model || DEFAULT_GEMINI_MODEL
-  const { segment } = params
+}
 
+/**
+ * The step-1 prompt. Shared by every provider: which model hears the audio is
+ * a transport detail, but what we ask of it — verbatim text, one label per
+ * voice, real names only when the audio says them — must not drift between
+ * providers, or the same meeting gets a different transcript depending on
+ * routing.
+ */
+function buildSegmentTranscriptionPrompt(params: TranscriptionSegmentParams): string {
+  const { segment } = params
   const partLabel = params.segmentCount > 1 ? `part ${segment.index + 1} of ${params.segmentCount} of ` : ''
   const knownSpeakers = params.knownSpeakers?.filter(Boolean) ?? []
 
-  const prompt = `You are meetutu AI, transcribing ${partLabel}a meeting recording.
+  return `You are meetutu AI, transcribing ${partLabel}a meeting recording.
 Listen to this audio and transcribe all spoken dialogue verbatim, as chronological lines with timestamps.
 
 SEPARATE THE VOICES. Every line belongs to exactly one speaker, and the same voice must always carry the same label. When two people talk over each other, write one line each rather than merging them.
@@ -430,6 +408,109 @@ Return ONLY a JSON object matching this exact schema:
     { "id": "t-1", "timestamp": "00:00", "seconds": 0, "speaker": "Andi (Host)", "text": "..." }
   ]
 }`
+}
+
+/**
+ * The model only heard one slice, so it numbers its timestamps from zero and
+ * restarts its ids. Both are rewritten into meeting time here rather than
+ * trusting the model to do arithmetic it cannot check.
+ */
+function parseSegmentTranscript(rawText: string, segment: AudioSegment, segmentCount: number): TranscriptItem[] {
+  const parsed = JSON.parse(stripCodeFence(rawText))
+  if (!Array.isArray(parsed.transcript)) {
+    throw new Error(`No transcript returned for part ${segment.index + 1} of ${segmentCount}`)
+  }
+
+  return (parsed.transcript as TranscriptItem[]).map((item, position) => {
+    const seconds = segment.startSeconds + Math.max(0, Number(item.seconds) || 0)
+    return {
+      ...item,
+      id: `t-${segment.index + 1}-${position + 1}`,
+      seconds,
+      timestamp: formatTimestamp(seconds),
+    }
+  })
+}
+
+export interface TranscriptAnalysisParams {
+  title: string
+  durationSeconds: number
+  transcript: TranscriptItem[]
+  customInstructions?: string
+}
+
+/** The step-2 prompt. Text only — the audio was already heard during step 1. */
+function buildTranscriptAnalysisPrompt(params: TranscriptAnalysisParams, needsGeneratedTitle: boolean): string {
+  const transcriptText = params.transcript
+    .map((item) => `[${item.timestamp} | ${item.seconds}s] ${item.speaker}: ${item.text}`)
+    .join('\n')
+
+  return `You are meetutu AI, a world-class executive meeting intelligence engine.
+Below is the full verbatim transcript of a meeting, with the speaker and the exact second offset of every line. Produce a structured executive summary of it.
+Refer to people by the speaker labels used in the transcript — assignees on action items must be one of those labels, or "Unassigned" when the transcript does not say who owns it.
+${SUMMARY_FIELDS_SPEC}
+Every "seconds" value MUST be copied from the transcript lines you are citing, and every "timestamp" string MUST be the matching "MM:SS" formatting of that same value.
+${needsGeneratedTitle ? 'Also produce a concise, specific meeting title (3-8 words) summarizing what was actually discussed — no generic placeholders.' : ''}
+${params.customInstructions ? `\nThe user has given you these additional instructions — follow them closely, adjusting tone/focus/language/structure as asked, while still returning the exact JSON schema below:\n"""\n${params.customInstructions}\n"""\n` : ''}
+
+Meeting Title: ${params.title || '(not provided — generate one from the actual content)'}
+Duration: ${params.durationSeconds || 30} seconds
+
+## Transcript
+${transcriptText}
+
+Return ONLY a JSON object matching this exact schema:
+{
+${SUMMARY_JSON_SCHEMA}${needsGeneratedTitle ? ',\n  "suggested_title": "..."' : ''}
+}`
+}
+
+export interface TranscriptAnalysis {
+  summary: MeetingSummary
+  suggestedTitle?: string
+}
+
+function parseTranscriptAnalysis(rawText: string, source: 'Gemini' | 'OpenRouter'): TranscriptAnalysis {
+  const parsed = JSON.parse(stripCodeFence(rawText))
+  if (!parsed.summary) {
+    throw new Error(`${source} response did not include a summary`)
+  }
+  return { summary: parsed.summary as MeetingSummary, suggestedTitle: parsed.suggested_title }
+}
+
+function needsGeneratedTitle(title: string): boolean {
+  return !title || title === UNTITLED_MEETING_TITLE
+}
+
+/**
+ * Step 1 of the pipeline: turn audio into a speaker-attributed transcript.
+ *
+ * This is the only call that ever hears the recording. It transcribes one
+ * slice of it — a 90-120 minute meeting does not fit in one response (see
+ * segmentation.ts) — separates the voices, and names them where the audio
+ * says who they are.
+ *
+ * The model only hears this slice, so it numbers its timestamps from zero and
+ * knows nothing about who spoke earlier; timestamps are shifted back into
+ * meeting time here, and `knownSpeakers`/`precedingContext` carry the identity
+ * of the people already found into the next slice.
+ */
+export async function transcribeAudioSegmentWithGemini(
+  params: TranscriptionSegmentParams & {
+    apiUrl?: string
+    apiKey: string
+    model?: string
+    cfAigToken?: string
+    audioBuffer?: ArrayBuffer
+    audioFile?: GeminiUploadedFile
+  },
+): Promise<TranscriptItem[]> {
+  const baseUrl = (params.apiUrl || DEFAULT_GEMINI_API_URL).replace(/\/$/, '')
+  const model = params.model || DEFAULT_GEMINI_MODEL
+  const { segment } = params
+
+  const partLabel = params.segmentCount > 1 ? `part ${segment.index + 1} of ${params.segmentCount} of ` : ''
+  const prompt = buildSegmentTranscriptionPrompt(params)
 
   const parts: Array<Record<string, unknown>> = [{ text: prompt }]
   if (params.audioFile) {
@@ -449,20 +530,45 @@ Return ONLY a JSON object matching this exact schema:
 
   const json = (await res.json()) as GeminiResponse
   const text = readGeminiText(json, `transcribing ${partLabel}the recording`)
-  const parsed = JSON.parse(stripCodeFence(text))
-  if (!Array.isArray(parsed.transcript)) {
-    throw new Error(`Gemini returned no transcript for part ${segment.index + 1} of ${params.segmentCount}`)
+  return parseSegmentTranscript(text, segment, params.segmentCount)
+}
+
+/**
+ * Step 1 over OpenRouter. Same prompt and same post-processing as the Gemini
+ * path; the difference is transport. OpenRouter takes audio only as inline
+ * base64 — there is no files API to stream a large slice through — so a
+ * segment has to be small enough to sit in the request body, which is what
+ * `MAX_SEGMENT_BYTES` in segmentation.ts guarantees.
+ */
+export async function transcribeAudioSegmentWithOpenRouter(
+  params: TranscriptionSegmentParams & {
+    apiKey: string
+    model?: string
+    audioBuffer?: ArrayBuffer
+  },
+): Promise<TranscriptItem[]> {
+  const { segment } = params
+  if (!params.audioBuffer || params.audioBuffer.byteLength === 0) {
+    // Without audio the model would happily write a plausible meeting from the
+    // prompt alone. Refuse instead of returning fiction.
+    throw new Error(`No audio to transcribe for part ${segment.index + 1} of ${params.segmentCount}`)
   }
 
-  return (parsed.transcript as TranscriptItem[]).map((item, position) => {
-    const seconds = segment.startSeconds + Math.max(0, Number(item.seconds) || 0)
-    return {
-      ...item,
-      id: `t-${segment.index + 1}-${position + 1}`,
-      seconds,
-      timestamp: formatTimestamp(seconds),
-    }
+  const partLabel = params.segmentCount > 1 ? `part ${segment.index + 1} of ${params.segmentCount} of ` : ''
+  const text = await requestOpenRouterJson({
+    apiKey: params.apiKey,
+    model: params.model || DEFAULT_OPENROUTER_MODEL,
+    what: `transcribing ${partLabel}the recording`,
+    content: [
+      { type: 'text', text: buildSegmentTranscriptionPrompt(params) },
+      {
+        type: 'input_audio',
+        input_audio: { data: Buffer.from(params.audioBuffer).toString('base64'), format: AUDIO_FILE_EXTENSION },
+      },
+    ],
   })
+
+  return parseSegmentTranscript(text, segment, params.segmentCount)
 }
 
 /**
@@ -473,42 +579,17 @@ Return ONLY a JSON object matching this exact schema:
  * information. It also means the analysis reasons over named speakers rather
  * than over sound.
  */
-export async function analyzeTranscriptWithGemini(params: {
-  apiUrl?: string
-  apiKey: string
-  model?: string
-  cfAigToken?: string
-  title: string
-  durationSeconds: number
-  transcript: TranscriptItem[]
-  customInstructions?: string
-}): Promise<{ summary: MeetingSummary; suggestedTitle?: string }> {
+export async function analyzeTranscriptWithGemini(
+  params: TranscriptAnalysisParams & {
+    apiUrl?: string
+    apiKey: string
+    model?: string
+    cfAigToken?: string
+  },
+): Promise<TranscriptAnalysis> {
   const baseUrl = (params.apiUrl || DEFAULT_GEMINI_API_URL).replace(/\/$/, '')
   const model = params.model || DEFAULT_GEMINI_MODEL
-  const needsGeneratedTitle = !params.title || params.title === UNTITLED_MEETING_TITLE
-
-  const transcriptText = params.transcript
-    .map((item) => `[${item.timestamp} | ${item.seconds}s] ${item.speaker}: ${item.text}`)
-    .join('\n')
-
-  const prompt = `You are meetutu AI, a world-class executive meeting intelligence engine.
-Below is the full verbatim transcript of a meeting, with the speaker and the exact second offset of every line. Produce a structured executive summary of it.
-Refer to people by the speaker labels used in the transcript — assignees on action items must be one of those labels, or "Unassigned" when the transcript does not say who owns it.
-${SUMMARY_FIELDS_SPEC}
-Every "seconds" value MUST be copied from the transcript lines you are citing, and every "timestamp" string MUST be the matching "MM:SS" formatting of that same value.
-${needsGeneratedTitle ? 'Also produce a concise, specific meeting title (3-8 words) summarizing what was actually discussed — no generic placeholders.' : ''}
-${params.customInstructions ? `\nThe user has given you these additional instructions — follow them closely, adjusting tone/focus/language/structure as asked, while still returning the exact JSON schema below:\n"""\n${params.customInstructions}\n"""\n` : ''}
-
-Meeting Title: ${params.title || '(not provided — generate one from the actual content)'}
-Duration: ${params.durationSeconds || 30} seconds
-
-## Transcript
-${transcriptText}
-
-Return ONLY a JSON object matching this exact schema:
-{
-${SUMMARY_JSON_SCHEMA}${needsGeneratedTitle ? ',\n  "suggested_title": "..."' : ''}
-}`
+  const prompt = buildTranscriptAnalysisPrompt(params, needsGeneratedTitle(params.title))
 
   const res = await fetchGeminiWithRetry(`${baseUrl}/models/${model}:generateContent`, {
     method: 'POST',
@@ -520,11 +601,24 @@ ${SUMMARY_JSON_SCHEMA}${needsGeneratedTitle ? ',\n  "suggested_title": "..."' : 
   })
 
   const json = (await res.json()) as GeminiResponse
-  const parsed = JSON.parse(stripCodeFence(readGeminiText(json, 'analyzing the transcript')))
-  if (!parsed.summary) {
-    throw new Error('Gemini response did not include a summary')
-  }
-  return { summary: parsed.summary as MeetingSummary, suggestedTitle: parsed.suggested_title }
+  return parseTranscriptAnalysis(readGeminiText(json, 'analyzing the transcript'), 'Gemini')
+}
+
+/** Step 2 over OpenRouter. Text only, same prompt as the Gemini path. */
+export async function analyzeTranscriptWithOpenRouter(
+  params: TranscriptAnalysisParams & {
+    apiKey: string
+    model?: string
+  },
+): Promise<TranscriptAnalysis> {
+  const text = await requestOpenRouterJson({
+    apiKey: params.apiKey,
+    model: params.model || DEFAULT_OPENROUTER_MODEL,
+    what: 'analyzing the transcript',
+    content: buildTranscriptAnalysisPrompt(params, needsGeneratedTitle(params.title)),
+  })
+
+  return parseTranscriptAnalysis(text, 'OpenRouter')
 }
 
 function buildChatSystemPrompt(params: { title: string; transcriptText: string; summaryText: string }): string {
@@ -549,35 +643,25 @@ export async function callOpenRouterChat(params: {
 }): Promise<string> {
   const model = params.model || DEFAULT_OPENROUTER_MODEL
 
-  const res = await fetch(OPENROUTER_CHAT_URL, {
-    method: 'POST',
-    headers: {
-      Authorization: `Bearer ${params.apiKey}`,
-      'HTTP-Referer': OPENROUTER_APP_URL,
-      'X-Title': OPENROUTER_APP_TITLE,
-      'Content-Type': 'application/json',
+  const res = await fetchWithRetry(
+    OPENROUTER_CHAT_URL,
+    {
+      method: 'POST',
+      headers: buildOpenRouterHeaders(params.apiKey),
+      body: JSON.stringify({
+        model,
+        messages: [
+          { role: 'system', content: buildChatSystemPrompt(params) },
+          ...params.history.map((turn) => ({ role: turn.role, content: turn.content })),
+          { role: 'user', content: params.message },
+        ],
+        temperature: 0.4,
+      }),
     },
-    body: JSON.stringify({
-      model,
-      messages: [
-        { role: 'system', content: buildChatSystemPrompt(params) },
-        ...params.history.map((turn) => ({ role: turn.role, content: turn.content })),
-        { role: 'user', content: params.message },
-      ],
-      temperature: 0.4,
-    }),
-  })
+    'OpenRouter API',
+  )
 
-  if (!res.ok) {
-    throw new Error(`OpenRouter API error (${res.status}): ${await res.text()}`)
-  }
-
-  const data = (await res.json()) as OpenRouterResponse
-  const content = data.choices?.[0]?.message?.content
-  if (!content) {
-    throw new Error('Empty response from OpenRouter AI')
-  }
-  return content.trim()
+  return readOpenRouterText((await res.json()) as OpenRouterResponse, 'answering a question about the meeting').trim()
 }
 
 export async function callGeminiChat(params: {

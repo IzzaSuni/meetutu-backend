@@ -302,13 +302,20 @@ export function createApp(deps: AppDeps): Hono {
     const session = storage.getSession(sessionId)
     const body = await readJson(c)
 
-    const providerPreference = c.req.header('X-AI-Provider') || str(body.provider) || 'gemini-gateway'
+    const providerPreference = c.req.header('X-AI-Provider') || str(body.provider) || config.aiProvider
     // Bound the user-supplied instructions so a runaway prompt can't blow up
     // token usage on a single regenerate request.
     const customInstructions =
       typeof body.customInstructions === 'string'
         ? body.customInstructions.trim().slice(0, MAX_CUSTOM_INSTRUCTION_CHARS)
         : undefined
+
+    // Both providers transcribe the recording itself, so there is nothing to
+    // do without audio — whichever one handles this.
+    const layout = await audio.getLayout(sessionId).catch(() => null)
+    if (!layout) {
+      return c.json({ success: false, error: 'No audio recording found for this session yet.', sessionId }, 404)
+    }
 
     let request: AnalysisRequest
 
@@ -337,9 +344,8 @@ export function createApp(deps: AppDeps): Hono {
       // would let a caller redirect it to an endpoint of their choosing.
       const model = str(body.model) || config.geminiModel
 
-      const layout = await audio.getLayout(sessionId).catch(() => null)
-      if (!layout) {
-        return c.json({ success: false, error: 'No audio recording found for this session yet.', sessionId }, 404)
+      if (!config.geminiApiKey) {
+        return c.json({ success: false, error: 'No Gemini API key configured.', sessionId }, 400)
       }
 
       request = {
@@ -444,7 +450,7 @@ export function createApp(deps: AppDeps): Hono {
     const transcriptText = buildTranscriptContext(transcript)
     const summaryText = buildSummaryText(summary)
     const title = session?.title || UNTITLED_MEETING_TITLE
-    const providerPreference = c.req.header('X-AI-Provider') || str(body.provider) || 'gemini-gateway'
+    const providerPreference = c.req.header('X-AI-Provider') || str(body.provider) || config.aiProvider
 
     try {
       if (providerPreference === 'openrouter') {
@@ -468,6 +474,9 @@ export function createApp(deps: AppDeps): Hono {
       }
 
       const model = str(body.model) || config.geminiModel
+      if (!config.geminiApiKey) {
+        return c.json({ success: false, error: 'No Gemini API key configured.', sessionId }, 400)
+      }
       const reply = await callGeminiChat({
         apiUrl: config.geminiApiUrl,
         apiKey: config.geminiApiKey,
@@ -491,6 +500,9 @@ export function createApp(deps: AppDeps): Hono {
   app.post('/api/ai/gemini-test', async (c) => {
     const body = await readJson(c)
     const model = str(body.model) || config.geminiModel
+    if (!config.geminiApiKey) {
+      return c.json({ success: false, error: 'No Gemini API key configured.' }, 400)
+    }
 
     try {
       const res = await fetchGeminiWithRetry(
