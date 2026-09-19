@@ -18,6 +18,25 @@ state is written to SQLite so a restart or a second process still sees it, and
 audio over 6 MiB is streamed to the Gemini Files API in 8 MiB chunks so the
 server never holds a whole recording in memory.
 
+## How analysis works
+
+Analysis is always **two steps**, whatever the length of the recording. The
+model is never asked to summarize straight off the audio; a summary is only
+ever derived from a transcript that exists.
+
+**Step 1 — transcribe, separate and identify the speakers.** The only call that
+hears the audio. It transcribes verbatim, attributes every line to exactly one
+voice, and names people by their real name wherever the audio says who they are
+(self-introduction, being addressed by name, signing off) — `Andi (Host)`,
+`Rina (Product)` — falling back to `Speaker 1`, `Speaker 2` only for a voice
+whose name is never spoken. It is told never to invent a name.
+
+**Step 2 — analyze the transcript.** Text only: overview, key points,
+decisions, action items and sentiment, with every citation pointing at a real
+second offset. Action-item assignees are speaker labels from step 1, so "who
+owns this" is a person rather than "Speaker 2". The audio is not re-sent —
+that would cost another ~230k input tokens for no extra information.
+
 ## Long meetings
 
 The target case is a **90-120 minute** meeting. At the 32 kbps mono the browser
@@ -25,32 +44,36 @@ records, that is 21.6-28.8 MB of MP3 and 173k-230k Gemini input tokens (audio
 costs 32 tokens/second) — comfortably inside the model's ~1M input window.
 
 The *output* window is the real constraint: 65,536 tokens, and a verbatim
-two-hour transcript plus its summary lands in the same order of magnitude once
-every line carries `id`/`timestamp`/`seconds`/`speaker` JSON around it. So a
-recording longer than one segment is handled in pieces:
+two-hour transcript lands in the same order of magnitude once every line
+carries `id`/`timestamp`/`seconds`/`speaker` JSON around it. So step 1 is done
+in slices:
 
-1. `planAudioSegments` cuts the recording into ≤15-minute, ≤6 MiB slices —
-   byte offsets stand in for time offsets because the MP3 is constant-bitrate.
-   Two hours is eight segments.
-2. Each slice is transcribed on its own, sequentially, and its timestamps are
-   shifted into absolute meeting time here rather than trusting the model to do
-   the arithmetic. A slice that starts mid-frame is advanced to the next frame
-   header.
-3. The summary is generated once, from the merged transcript as text — the
-   audio is not re-sent.
+- `planAudioSegments` cuts the recording into ≤15-minute, ≤6 MiB slices — byte
+  offsets stand in for time offsets because the MP3 is constant-bitrate. Two
+  hours is eight slices. A slice that starts mid-frame is advanced to the next
+  MPEG frame header.
+- Slices are transcribed one at a time, and each one is told which speakers the
+  earlier slices already identified and how the conversation was going at the
+  cut. Without that, the same person becomes "Speaker 1" again in every part.
+- Timestamps come back relative to the slice and are shifted into absolute
+  meeting time here, rather than trusting the model to do the arithmetic.
 
-A truncated or blocked response is now reported as such (`finishReason`), and a
-failing segment says which one it was, instead of surfacing as an unexplained
+Step 2 then runs once over the merged transcript.
+
+A truncated or blocked response is reported as such (`finishReason`), and a
+failing slice says which one it was, instead of surfacing as an unexplained
 `JSON.parse` error after ten minutes of work.
 
 Two consequences for clients:
 
-- **Analysis of a two-hour meeting takes minutes, not seconds** (eight model
-  calls plus a summary). Poll `/analysis-status` with a generous timeout; a
-  five-minute client-side cap will give up while the job is still healthy.
-- While a segmented job runs, `/analysis-status` carries
-  `progress: { stage, completedSegments, totalSegments }` so the UI can show
-  more than a spinner.
+- **Analysis of a two-hour meeting takes minutes, not seconds** (eight
+  transcription calls plus the analysis). Poll `/analysis-status` with a
+  generous timeout; a five-minute client-side cap will give up while the job is
+  still healthy.
+- While a job runs, `/analysis-status` carries
+  `progress: { stage, completedSegments, totalSegments }` — `stage` is
+  `transcribing` until every slice is done, then `analyzing` — so the UI can
+  show more than a spinner.
 
 Chat over a long meeting keeps 200k characters of transcript in context, and
 trims from the middle rather than the end when it has to — decisions and action

@@ -377,69 +377,18 @@ Please generate the comprehensive transcript and executive meeting summary accor
   return parseAnalysisJson(content, 'OpenRouter')
 }
 
-export async function callGeminiGatewayAI(params: {
-  apiUrl?: string
-  apiKey: string
-  model?: string
-  title: string
-  durationSeconds: number
-  audioBuffer?: ArrayBuffer
-  /** Reference to audio already uploaded via the Files API — preferred over audioBuffer for long recordings. */
-  audioFile?: GeminiUploadedFile
-  customInstructions?: string
-  cfAigToken?: string
-}): Promise<AiAnalysisResult> {
-  const baseUrl = (params.apiUrl || DEFAULT_GEMINI_API_URL).replace(/\/$/, '')
-  const model = params.model || DEFAULT_GEMINI_MODEL
-  const needsGeneratedTitle = !params.title || params.title === UNTITLED_MEETING_TITLE
-
-  const prompt = buildAnalysisPrompt({
-    title: params.title,
-    durationSeconds: params.durationSeconds,
-    hasAudio: Boolean(params.audioBuffer || params.audioFile),
-    needsGeneratedTitle,
-    customInstructions: params.customInstructions,
-  })
-
-  const parts: Array<Record<string, unknown>> = [{ text: prompt }]
-
-  if (params.audioFile) {
-    parts.push({
-      fileData: {
-        mimeType: params.audioFile.mimeType,
-        fileUri: params.audioFile.fileUri,
-      },
-    })
-  } else if (params.audioBuffer && params.audioBuffer.byteLength > 0) {
-    parts.push({
-      inlineData: {
-        mimeType: 'audio/mp3',
-        data: Buffer.from(params.audioBuffer).toString('base64'),
-      },
-    })
-  }
-
-  const res = await fetchGeminiWithRetry(`${baseUrl}/models/${model}:generateContent`, {
-    method: 'POST',
-    headers: buildGeminiHeaders(params.apiKey, params.cfAigToken),
-    body: JSON.stringify({
-      contents: [{ parts }],
-      generationConfig: { responseMimeType: 'application/json', maxOutputTokens: GEMINI_MAX_OUTPUT_TOKENS },
-    }),
-  })
-
-  const json = (await res.json()) as GeminiResponse
-  return parseAnalysisJson(readGeminiText(json, 'analyzing the meeting'), 'Gemini')
-}
-
 /**
- * Transcribes one slice of a long recording.
+ * Step 1 of the pipeline: turn audio into a speaker-attributed transcript.
  *
- * Segments are transcribed separately because a verbatim transcript of a
- * 90-120 minute meeting does not fit in one response (see segmentation.ts).
- * The model only hears this slice, so it numbers its timestamps from zero;
- * they are shifted back into meeting time here rather than trusting the model
- * to do the arithmetic.
+ * This is the only call that ever hears the recording. It transcribes one
+ * slice of it — a 90-120 minute meeting does not fit in one response (see
+ * segmentation.ts) — separates the voices, and names them where the audio
+ * says who they are.
+ *
+ * The model only hears this slice, so it numbers its timestamps from zero and
+ * knows nothing about who spoke earlier; timestamps are shifted back into
+ * meeting time here, and `knownSpeakers`/`precedingContext` carry the identity
+ * of the people already found into the next slice.
  */
 export async function transcribeAudioSegmentWithGemini(params: {
   apiUrl?: string
@@ -450,24 +399,35 @@ export async function transcribeAudioSegmentWithGemini(params: {
   audioFile?: GeminiUploadedFile
   segment: AudioSegment
   segmentCount: number
+  /** Speaker labels already established in earlier segments of this meeting. */
+  knownSpeakers?: string[]
+  /** The last few transcript lines before this slice, for continuity across the cut. */
+  precedingContext?: string
   customInstructions?: string
 }): Promise<TranscriptItem[]> {
   const baseUrl = (params.apiUrl || DEFAULT_GEMINI_API_URL).replace(/\/$/, '')
   const model = params.model || DEFAULT_GEMINI_MODEL
   const { segment } = params
 
-  const prompt = `You are meetutu AI, transcribing part ${segment.index + 1} of ${params.segmentCount} of a longer meeting recording.
-Listen to this audio and transcribe all spoken dialogue verbatim, as chronological segments with timestamps and realistic speaker labels (e.g. "Speaker 1 (Host)", "Speaker 2 (Participant)").
-Keep speaker labels consistent with the numbering you would use for the whole meeting: the first voice you hear is "Speaker 1" unless the audio makes another mapping obvious.
+  const partLabel = params.segmentCount > 1 ? `part ${segment.index + 1} of ${params.segmentCount} of ` : ''
+  const knownSpeakers = params.knownSpeakers?.filter(Boolean) ?? []
+
+  const prompt = `You are meetutu AI, transcribing ${partLabel}a meeting recording.
+Listen to this audio and transcribe all spoken dialogue verbatim, as chronological lines with timestamps.
+
+SEPARATE THE VOICES. Every line belongs to exactly one speaker, and the same voice must always carry the same label. When two people talk over each other, write one line each rather than merging them.
+
+IDENTIFY THE PEOPLE. Use a person's real name whenever the audio itself reveals it — they introduce themselves, someone addresses them by name, they sign off with their name. Write it as "Name (Role)" when the role is also clear, e.g. "Andi (Host)" or "Rina (Product)"; otherwise just the name. Fall back to "Speaker 1", "Speaker 2", ... only for a voice whose name is never spoken. NEVER INVENT A NAME that was not said in the audio, and never guess a name from the meeting title.
+${knownSpeakers.length > 0 ? `\nThese speakers have already been identified earlier in this meeting:\n${knownSpeakers.map((name) => `- ${name}`).join('\n')}\nReuse those exact labels whenever you hear the same person again. Add a new label only for a genuinely new voice.\n` : ''}${params.precedingContext ? `\nThe meeting was already in progress; these are the last lines before this clip starts:\n"""\n${params.precedingContext}\n"""\n` : ''}
 Timestamps must be relative to the START OF THIS AUDIO CLIP, beginning at 00:00 — do not try to account for earlier parts of the meeting.
-Transcribe only what is actually spoken. Do not summarize, and do not invent dialogue to fill silence.
+Transcribe only what is actually spoken. Do not summarize, do not add commentary, and do not invent dialogue to fill silence.
 ${params.customInstructions ? `\nThe user has asked for this transcript to follow these instructions where they apply to transcription (language, formatting, terminology):\n"""\n${params.customInstructions}\n"""\n` : ''}
 This clip is about ${segment.durationSeconds} seconds long.
 
 Return ONLY a JSON object matching this exact schema:
 {
   "transcript": [
-    { "id": "t-1", "timestamp": "00:00", "seconds": 0, "speaker": "Speaker 1 (Host)", "text": "..." }
+    { "id": "t-1", "timestamp": "00:00", "seconds": 0, "speaker": "Andi (Host)", "text": "..." }
   ]
 }`
 
@@ -488,7 +448,7 @@ Return ONLY a JSON object matching this exact schema:
   })
 
   const json = (await res.json()) as GeminiResponse
-  const text = readGeminiText(json, `transcribing part ${segment.index + 1} of ${params.segmentCount}`)
+  const text = readGeminiText(json, `transcribing ${partLabel}the recording`)
   const parsed = JSON.parse(stripCodeFence(text))
   if (!Array.isArray(parsed.transcript)) {
     throw new Error(`Gemini returned no transcript for part ${segment.index + 1} of ${params.segmentCount}`)
@@ -506,11 +466,14 @@ Return ONLY a JSON object matching this exact schema:
 }
 
 /**
- * Produces the executive summary from an already-merged transcript. Text only:
- * the audio was heard during transcription, and re-sending two hours of it
- * would cost another ~230k input tokens for no extra information.
+ * Step 2 of the pipeline: analyze the finished transcript.
+ *
+ * Text only — the audio was already heard during transcription, and re-sending
+ * two hours of it would cost another ~230k input tokens for no extra
+ * information. It also means the analysis reasons over named speakers rather
+ * than over sound.
  */
-export async function summarizeTranscriptWithGemini(params: {
+export async function analyzeTranscriptWithGemini(params: {
   apiUrl?: string
   apiKey: string
   model?: string
@@ -529,7 +492,8 @@ export async function summarizeTranscriptWithGemini(params: {
     .join('\n')
 
   const prompt = `You are meetutu AI, a world-class executive meeting intelligence engine.
-Below is the full verbatim transcript of a meeting, with the exact second offset of every line. Produce a structured executive summary of it.
+Below is the full verbatim transcript of a meeting, with the speaker and the exact second offset of every line. Produce a structured executive summary of it.
+Refer to people by the speaker labels used in the transcript — assignees on action items must be one of those labels, or "Unassigned" when the transcript does not say who owns it.
 ${SUMMARY_FIELDS_SPEC}
 Every "seconds" value MUST be copied from the transcript lines you are citing, and every "timestamp" string MUST be the matching "MM:SS" formatting of that same value.
 ${needsGeneratedTitle ? 'Also produce a concise, specific meeting title (3-8 words) summarizing what was actually discussed — no generic placeholders.' : ''}
@@ -556,7 +520,7 @@ ${SUMMARY_JSON_SCHEMA}${needsGeneratedTitle ? ',\n  "suggested_title": "..."' : 
   })
 
   const json = (await res.json()) as GeminiResponse
-  const parsed = JSON.parse(stripCodeFence(readGeminiText(json, 'summarizing the meeting')))
+  const parsed = JSON.parse(stripCodeFence(readGeminiText(json, 'analyzing the transcript')))
   if (!parsed.summary) {
     throw new Error('Gemini response did not include a summary')
   }

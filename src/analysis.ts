@@ -1,7 +1,6 @@
 import {
-  callGeminiGatewayAI,
+  analyzeTranscriptWithGemini,
   callOpenRouterAI,
-  summarizeTranscriptWithGemini,
   transcribeAudioSegmentWithGemini,
   uploadAudioToGeminiFiles,
   type AiAnalysisResult,
@@ -36,7 +35,7 @@ export interface AnalysisRequest {
 
 /** Coarse progress for a long job, so a client polling status can show more than a spinner. */
 export interface AnalysisProgress {
-  stage: 'transcribing' | 'summarizing'
+  stage: 'transcribing' | 'analyzing'
   completedSegments: number
   totalSegments: number
 }
@@ -172,7 +171,12 @@ function toArrayBuffer(bytes: Uint8Array): ArrayBuffer {
   return bytes.buffer.slice(bytes.byteOffset, bytes.byteOffset + bytes.byteLength) as ArrayBuffer
 }
 
-/** Builds the Gemini analysis path: stream audio off disk, then ask for the transcript. */
+/**
+ * The Gemini path, in two steps: transcribe the audio (separating and naming
+ * the speakers), then analyze the resulting transcript. The model is never
+ * asked to summarize straight off the audio — a summary is only ever derived
+ * from a transcript that exists.
+ */
 export function createGeminiGenerator(deps: {
   audio: AudioStorage
   apiKey: string
@@ -196,67 +200,65 @@ export function createGeminiGenerator(deps: {
       maxSegmentSeconds: deps.maxSegmentSeconds,
       maxSegmentBytes: deps.maxSegmentBytes,
     })
-
-    // A 90-120 minute meeting cannot be transcribed in one response, so it is
-    // transcribed segment by segment and summarized from the merged result.
-    if (segments.length > 1) {
-      return analyzeInSegments({ deps, inlineMaxBytes, layout, segments, request, hooks })
+    if (segments.length === 0) {
+      throw new Error('The recording for this session is empty.')
     }
 
-    // Long recordings go through the Files API so their bytes are streamed to
-    // Google a chunk at a time and referenced by URI — the server never holds
-    // the whole meeting, let alone its base64 expansion.
-    const audioFile =
-      layout.totalBytes > inlineMaxBytes
-        ? await uploadAudioToGeminiFiles({
-            apiKey: deps.apiKey,
-            cfAigToken: deps.cfAigToken,
-            byteLength: layout.totalBytes,
-            mimeType: AUDIO_CONTENT_TYPE,
-            displayName: `meetutu-session-${request.sessionId}.${AUDIO_FILE_EXTENSION}`,
-            readChunk: (offset, length) => deps.audio.readRange(layout, offset, length),
-          })
-        : undefined
+    const transcript = await transcribeRecording({ deps, inlineMaxBytes, layout, segments, request, hooks })
 
-    let audioBuffer: ArrayBuffer | undefined
-    if (!audioFile) {
-      audioBuffer = toArrayBuffer(await deps.audio.readRange(layout, 0, layout.totalBytes))
-    }
+    hooks.onProgress?.({
+      stage: 'analyzing',
+      completedSegments: segments.length,
+      totalSegments: segments.length,
+    })
 
-    return callGeminiGatewayAI({
+    const { summary, suggestedTitle } = await analyzeTranscriptWithGemini({
       apiUrl: deps.apiUrl,
       apiKey: deps.apiKey,
       model: request.model,
+      cfAigToken: deps.cfAigToken,
       title: request.title,
       durationSeconds: request.durationSeconds,
-      audioBuffer,
-      audioFile,
+      transcript,
       customInstructions: request.customInstructions,
-      cfAigToken: deps.cfAigToken,
     })
+
+    return { transcript, summary, suggestedTitle }
   }
 }
 
+/** How many trailing lines of the previous segment to show the model for continuity. */
+const CONTINUITY_LINES = 3
+
+function renderContinuity(transcript: TranscriptItem[]): string | undefined {
+  if (transcript.length === 0) return undefined
+  return transcript
+    .slice(-CONTINUITY_LINES)
+    .map((item) => `[${item.timestamp}] ${item.speaker}: ${item.text}`)
+    .join('\n')
+}
+
 /**
- * Transcribes each segment in turn, then summarizes the merged transcript.
+ * Step 1: audio in, speaker-attributed transcript out.
  *
- * Segments run sequentially on purpose: they are minutes of model time each,
- * running them in parallel multiplies peak memory and invites rate limiting,
- * and there is no deadline to race — the whole point of this backend is that a
- * job may take as long as it takes.
+ * Segments run sequentially on purpose. Beyond memory and rate limits, each
+ * one is told which speakers the earlier segments already identified and how
+ * the conversation was going at the cut, so one person keeps one label across
+ * the whole meeting instead of becoming "Speaker 1" again in every part.
  */
-async function analyzeInSegments(params: {
+async function transcribeRecording(params: {
   deps: { audio: AudioStorage; apiKey: string; apiUrl?: string; cfAigToken?: string }
   inlineMaxBytes: number
   layout: Awaited<ReturnType<AudioStorage['getLayout']>>
   segments: AudioSegment[]
   request: AnalysisRequest
   hooks: AnalysisHooks
-}): Promise<AiAnalysisResult> {
+}): Promise<TranscriptItem[]> {
   const { deps, layout, segments, request, hooks } = params
   if (!layout) throw new Error('No audio recording found for this session yet.')
 
   const transcript: TranscriptItem[] = []
+  const speakers: string[] = []
 
   for (const segment of segments) {
     const raw = await deps.audio.readRange(layout, segment.byteOffset, segment.byteLength)
@@ -292,6 +294,8 @@ async function analyzeInSegments(params: {
       audioFile,
       segment,
       segmentCount: segments.length,
+      knownSpeakers: speakers,
+      precedingContext: renderContinuity(transcript),
       customInstructions: request.customInstructions,
     }).catch((error: unknown) => {
       const message = error instanceof Error ? error.message : String(error)
@@ -302,6 +306,9 @@ async function analyzeInSegments(params: {
       )
     })
     transcript.push(...items)
+    for (const item of items) {
+      if (item.speaker && !speakers.includes(item.speaker)) speakers.push(item.speaker)
+    }
 
     hooks.onProgress?.({
       stage: 'transcribing',
@@ -310,20 +317,7 @@ async function analyzeInSegments(params: {
     })
   }
 
-  hooks.onProgress?.({ stage: 'summarizing', completedSegments: segments.length, totalSegments: segments.length })
-
-  const { summary, suggestedTitle } = await summarizeTranscriptWithGemini({
-    apiUrl: deps.apiUrl,
-    apiKey: deps.apiKey,
-    model: request.model,
-    cfAigToken: deps.cfAigToken,
-    title: request.title,
-    durationSeconds: request.durationSeconds,
-    transcript,
-    customInstructions: request.customInstructions,
-  })
-
-  return { transcript, summary, suggestedTitle }
+  return transcript
 }
 
 /** Dispatches to the provider the request asked for. */

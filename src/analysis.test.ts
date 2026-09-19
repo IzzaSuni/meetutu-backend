@@ -388,7 +388,7 @@ describe('long-meeting segmentation', () => {
     expect(new Set(result.transcript.map((item) => item.id)).size).toBe(8)
   })
 
-  it('summarizes from the merged transcript rather than re-sending the audio', async () => {
+  it('analyzes the merged transcript rather than re-sending the audio', async () => {
     let summaryBody = ''
     globalThis.fetch = vi.fn(async (_url: string | URL, init?: RequestInit) => {
       const body = String(init?.body ?? '')
@@ -424,24 +424,59 @@ describe('long-meeting segmentation', () => {
     })
 
     expect(updates[0]).toBe('transcribing 1/8')
-    expect(updates.at(-1)).toBe('summarizing 8/8')
+    expect(updates.at(-1)).toBe('analyzing 8/8')
   })
 
-  it('keeps the single-request path for a short meeting', async () => {
+  it('transcribes then analyzes even for a short meeting, never in one call', async () => {
+    // Arrange: transcription and analysis are separate steps regardless of
+    // length — the model is never asked to summarize straight off the audio.
     const bodies: string[] = []
     globalThis.fetch = vi.fn(async (_url: string | URL, init?: RequestInit) => {
-      bodies.push(String(init?.body ?? ''))
-      return jsonOk({
-        transcript: [{ id: 't-1', timestamp: '00:00', seconds: 0, speaker: 'Speaker 1', text: 'Hi.' }],
-        summary: { overview: 'Short.', key_points: [], action_items: [], decisions: [] },
-      })
+      const body = String(init?.body ?? '')
+      bodies.push(body)
+      if (body.includes('"inlineData"')) {
+        return jsonOk({
+          transcript: [{ id: 't-1', timestamp: '00:00', seconds: 0, speaker: 'Andi (Host)', text: 'Hi.' }],
+        })
+      }
+      return jsonOk({ summary: { overview: 'Short.', key_points: [], action_items: [], decisions: [] } })
     }) as unknown as typeof fetch
     await putRecording(360)
 
+    // Act
     const result = await segmentedGenerator()(request({ durationSeconds: 90 }), {})
 
-    expect(bodies).toHaveLength(1)
+    // Assert
+    expect(bodies).toHaveLength(2)
+    expect(bodies[0]).toContain('"inlineData"')
+    expect(bodies[1]).not.toContain('"inlineData"')
+    expect(result.transcript[0].speaker).toBe('Andi (Host)')
     expect(result.summary.overview).toBe('Short.')
+  })
+
+  it('reuses speaker labels from earlier segments in later ones', async () => {
+    // Arrange: each segment is a separate call, so the model has to be told
+    // who has already been identified or "Speaker 1" drifts between people.
+    const prompts: string[] = []
+    globalThis.fetch = vi.fn(async (_url: string | URL, init?: RequestInit) => {
+      const body = String(init?.body ?? '')
+      if (body.includes('"inlineData"')) {
+        prompts.push(JSON.parse(body).contents[0].parts[0].text)
+        return jsonOk({
+          transcript: [{ id: 't-1', timestamp: '00:01', seconds: 1, speaker: 'Dewi (Finance)', text: 'Yes.' }],
+        })
+      }
+      return jsonOk({ summary: { overview: 'ok', key_points: [], action_items: [], decisions: [] } })
+    }) as unknown as typeof fetch
+    await putRecording()
+
+    // Act
+    await segmentedGenerator()(request({ durationSeconds: TWO_HOURS }), {})
+
+    // Assert
+    expect(prompts[0]).not.toContain('Dewi (Finance)')
+    expect(prompts[1]).toContain('Dewi (Finance)')
+    expect(prompts[1]).toContain('Yes.')
   })
 
   it('uploads an oversized segment through the Files API instead of inlining it', async () => {

@@ -2,10 +2,9 @@ import { describe, it, expect, vi, afterEach } from 'vitest'
 import {
   GEMINI_MAX_OUTPUT_TOKENS,
   GEMINI_UPLOAD_CHUNK_BYTES,
+  analyzeTranscriptWithGemini,
   callGeminiChat,
-  callGeminiGatewayAI,
   fetchGeminiWithRetry,
-  summarizeTranscriptWithGemini,
   transcribeAudioSegmentWithGemini,
   uploadAudioToGeminiFiles,
 } from './ai-providers.js'
@@ -163,19 +162,24 @@ describe('uploadAudioToGeminiFiles', () => {
   })
 })
 
-describe('callGeminiGatewayAI', () => {
+describe('transcribeAudioSegmentWithGemini (audio handling)', () => {
+  const SEGMENT = { index: 0, byteOffset: 0, byteLength: 3, startSeconds: 0, durationSeconds: 60 }
+  const TRANSCRIPT_ONLY = {
+    transcript: [{ id: 't-1', timestamp: '00:00', seconds: 0, speaker: 'Andi (Host)', text: 'Hello.' }],
+  }
+
   it('references an already-uploaded file instead of inlining audio bytes', async () => {
     let body: any
     globalThis.fetch = vi.fn(async (_url: string | URL, init?: RequestInit) => {
       body = JSON.parse(String(init?.body))
-      return jsonResponse(geminiCandidate(AI_RESULT))
+      return jsonResponse(geminiCandidate(TRANSCRIPT_ONLY))
     }) as unknown as typeof fetch
 
-    const result = await callGeminiGatewayAI({
+    const items = await transcribeAudioSegmentWithGemini({
       apiKey: 'key',
-      title: 'Untitled Meeting',
-      durationSeconds: 60,
       audioFile: { fileUri: 'https://files.test/abc', mimeType: 'audio/mpeg' },
+      segment: SEGMENT,
+      segmentCount: 1,
     })
 
     const parts = body.contents[0].parts
@@ -184,44 +188,120 @@ describe('callGeminiGatewayAI', () => {
       mimeType: 'audio/mpeg',
       fileUri: 'https://files.test/abc',
     })
-    expect(result.suggestedTitle).toBe('Weekly Sync')
+    expect(items[0].speaker).toBe('Andi (Host)')
   })
 
   it('inlines a small audio buffer as base64', async () => {
     let body: any
     globalThis.fetch = vi.fn(async (_url: string | URL, init?: RequestInit) => {
       body = JSON.parse(String(init?.body))
-      return jsonResponse(geminiCandidate(AI_RESULT))
+      return jsonResponse(geminiCandidate(TRANSCRIPT_ONLY))
     }) as unknown as typeof fetch
 
-    await callGeminiGatewayAI({
+    await transcribeAudioSegmentWithGemini({
       apiKey: 'key',
-      title: 'Sync',
-      durationSeconds: 10,
       audioBuffer: new Uint8Array([1, 2, 3]).buffer,
+      segment: SEGMENT,
+      segmentCount: 1,
     })
 
     const inline = body.contents[0].parts.find((p: any) => p.inlineData)
     expect(inline.inlineData.data).toBe(Buffer.from([1, 2, 3]).toString('base64'))
   })
 
-  it('rejects a response that is missing the transcript/summary shape', async () => {
-    globalThis.fetch = vi.fn(async () => jsonResponse(geminiCandidate({ nope: true }))) as unknown as typeof fetch
-
-    await expect(
-      callGeminiGatewayAI({ apiKey: 'key', title: 'Sync', durationSeconds: 10 })
-    ).rejects.toThrow(/expected transcript\/summary/)
-  })
-
   it('strips a fenced code block before parsing', async () => {
     globalThis.fetch = vi.fn(async () =>
       jsonResponse({
-        candidates: [{ content: { parts: [{ text: '```json\n' + JSON.stringify(AI_RESULT) + '\n```' }] } }],
+        candidates: [{ content: { parts: [{ text: '```json\n' + JSON.stringify(TRANSCRIPT_ONLY) + '\n```' }] } }],
       })
     ) as unknown as typeof fetch
 
-    const result = await callGeminiGatewayAI({ apiKey: 'key', title: 'Sync', durationSeconds: 10 })
-    expect(result.transcript).toHaveLength(1)
+    const items = await transcribeAudioSegmentWithGemini({
+      apiKey: 'key',
+      audioBuffer: new Uint8Array([1]).buffer,
+      segment: SEGMENT,
+      segmentCount: 1,
+    })
+    expect(items).toHaveLength(1)
+  })
+})
+
+describe('speaker identification', () => {
+  const SEGMENT = { index: 1, byteOffset: 0, byteLength: 3, startSeconds: 900, durationSeconds: 900 }
+
+  function captureTranscriptionPrompt(): { prompt: () => string } {
+    let captured = ''
+    globalThis.fetch = vi.fn(async (_url: string | URL, init?: RequestInit) => {
+      captured = JSON.parse(String(init?.body)).contents[0].parts[0].text
+      return jsonResponse(geminiCandidate({ transcript: [] }))
+    }) as unknown as typeof fetch
+    return { prompt: () => captured }
+  }
+
+  it('asks for real names and one label per voice', async () => {
+    // Arrange
+    const captured = captureTranscriptionPrompt()
+
+    // Act
+    await transcribeAudioSegmentWithGemini({
+      apiKey: 'k',
+      audioBuffer: new Uint8Array([1]).buffer,
+      segment: SEGMENT,
+      segmentCount: 2,
+    })
+
+    // Assert
+    expect(captured.prompt()).toMatch(/real name/i)
+    expect(captured.prompt()).toMatch(/never invent a name/i)
+  })
+
+  it('carries the speakers found so far into a later segment', async () => {
+    // Arrange: without this, "Speaker 1" in part 2 can be a different person
+    // than "Speaker 1" in part 1.
+    const captured = captureTranscriptionPrompt()
+
+    // Act
+    await transcribeAudioSegmentWithGemini({
+      apiKey: 'k',
+      audioBuffer: new Uint8Array([1]).buffer,
+      segment: SEGMENT,
+      segmentCount: 2,
+      knownSpeakers: ['Dewi (Finance)', 'Bagus'],
+    })
+
+    // Assert
+    expect(captured.prompt()).toContain('Dewi (Finance)')
+    expect(captured.prompt()).toContain('Bagus')
+  })
+
+  it('shows the model the lines immediately before the cut', async () => {
+    // Arrange
+    const captured = captureTranscriptionPrompt()
+
+    // Act
+    await transcribeAudioSegmentWithGemini({
+      apiKey: 'k',
+      audioBuffer: new Uint8Array([1]).buffer,
+      segment: SEGMENT,
+      segmentCount: 2,
+      precedingContext: '[14:45] Dewi (Finance): so about the budget—',
+    })
+
+    // Assert
+    expect(captured.prompt()).toContain('so about the budget—')
+  })
+
+  it('sends no roster on the first segment', async () => {
+    const captured = captureTranscriptionPrompt()
+
+    await transcribeAudioSegmentWithGemini({
+      apiKey: 'k',
+      audioBuffer: new Uint8Array([1]).buffer,
+      segment: { index: 0, byteOffset: 0, byteLength: 3, startSeconds: 0, durationSeconds: 900 },
+      segmentCount: 2,
+    })
+
+    expect(captured.prompt()).not.toMatch(/already been identified/i)
   })
 })
 
@@ -279,7 +359,12 @@ describe('output-token truncation', () => {
 
     // Act / Assert
     await expect(
-      callGeminiGatewayAI({ apiKey: 'k', title: 'Sync', durationSeconds: 7200 }),
+      transcribeAudioSegmentWithGemini({
+        apiKey: 'k',
+        audioBuffer: new Uint8Array([1]).buffer,
+        segment: { index: 0, byteOffset: 0, byteLength: 1, startSeconds: 0, durationSeconds: 900 },
+        segmentCount: 8,
+      }),
     ).rejects.toThrow(/output limit/i)
   })
 
@@ -288,14 +373,16 @@ describe('output-token truncation', () => {
       .fn()
       .mockResolvedValue(jsonResponse({ candidates: [{ finishReason: 'SAFETY', content: { parts: [] } }] })) as unknown as typeof fetch
 
-    await expect(callGeminiGatewayAI({ apiKey: 'k', title: 'Sync', durationSeconds: 60 })).rejects.toThrow(/SAFETY/)
+    await expect(
+      analyzeTranscriptWithGemini({ apiKey: 'k', title: 'Sync', durationSeconds: 60, transcript: [] }),
+    ).rejects.toThrow(/SAFETY/)
   })
 
   it('asks for the full output budget', async () => {
-    const fetchMock = vi.fn().mockResolvedValue(jsonResponse(geminiCandidate(AI_RESULT)))
+    const fetchMock = vi.fn().mockResolvedValue(jsonResponse(geminiCandidate({ summary: AI_RESULT.summary })))
     globalThis.fetch = fetchMock as unknown as typeof fetch
 
-    await callGeminiGatewayAI({ apiKey: 'k', title: 'Sync', durationSeconds: 60 })
+    await analyzeTranscriptWithGemini({ apiKey: 'k', title: 'Sync', durationSeconds: 60, transcript: [] })
 
     const body = JSON.parse((fetchMock.mock.calls[0][1] as RequestInit).body as string)
     expect(body.generationConfig.maxOutputTokens).toBe(GEMINI_MAX_OUTPUT_TOKENS)
@@ -367,7 +454,7 @@ describe('transcribeAudioSegmentWithGemini', () => {
   })
 })
 
-describe('summarizeTranscriptWithGemini', () => {
+describe('analyzeTranscriptWithGemini', () => {
   const transcript = [{ id: 't-1', timestamp: '00:00', seconds: 0, speaker: 'Speaker 1', text: 'Ship on Friday.' }]
 
   it('summarizes from transcript text without re-sending the audio', async () => {
@@ -383,7 +470,7 @@ describe('summarizeTranscriptWithGemini', () => {
     globalThis.fetch = fetchMock as unknown as typeof fetch
 
     // Act
-    const result = await summarizeTranscriptWithGemini({
+    const result = await analyzeTranscriptWithGemini({
       apiKey: 'k',
       title: '',
       durationSeconds: 7200,
@@ -404,7 +491,7 @@ describe('summarizeTranscriptWithGemini', () => {
       .mockResolvedValue(jsonResponse(geminiCandidate({ suggested_title: 'Only a title' }))) as unknown as typeof fetch
 
     await expect(
-      summarizeTranscriptWithGemini({ apiKey: 'k', title: 'Sync', durationSeconds: 60, transcript }),
+      analyzeTranscriptWithGemini({ apiKey: 'k', title: 'Sync', durationSeconds: 60, transcript }),
     ).rejects.toThrow(/summary/i)
   })
 })
