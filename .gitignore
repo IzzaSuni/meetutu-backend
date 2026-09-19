@@ -1,0 +1,14 @@
+node_modules/
+dist/
+coverage/
+
+# Runtime data: SQLite database and stored audio
+data/
+
+# Secrets
+.env
+.env.local
+.env.*.local
+
+*.log
+.DS_Store

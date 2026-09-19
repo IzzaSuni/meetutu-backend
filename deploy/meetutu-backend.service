@@ -1,0 +1,39 @@
+[Unit]
+Description=meetutu backend
+Documentation=https://github.com/IzzaSuni/meetutu-backend
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+User=meetutu
+Group=meetutu
+WorkingDirectory=/opt/meetutu-backend
+EnvironmentFile=/etc/meetutu-backend.env
+ExecStart=/usr/bin/node dist/server.js
+Restart=on-failure
+RestartSec=5
+
+# Analysis of a long meeting can run for many minutes; give it time to drain
+# on stop instead of killing a job mid-transcription.
+KillSignal=SIGTERM
+TimeoutStopSec=300
+
+# Hardening: the service only needs to read its own code and write DATA_DIR.
+NoNewPrivileges=true
+PrivateTmp=true
+ProtectSystem=strict
+ProtectHome=true
+ReadWritePaths=/var/lib/meetutu
+ProtectKernelTunables=true
+ProtectKernelModules=true
+ProtectControlGroups=true
+RestrictSUIDSGID=true
+LockPersonality=true
+
+StandardOutput=journal
+StandardError=journal
+SyslogIdentifier=meetutu-backend
+
+[Install]
+WantedBy=multi-user.target
