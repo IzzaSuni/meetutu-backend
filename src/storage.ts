@@ -12,6 +12,8 @@ export interface Storage {
   putSummary(sessionId: number, summary: MeetingSummary): void
   getAnalysisJob(sessionId: number): AnalysisJobRecord | undefined
   putAnalysisJob(sessionId: number, job: Omit<AnalysisJobRecord, 'updated_at'>): void
+  /** Fails every job still marked processing. Returns how many rows were changed. */
+  failStaleAnalysisJobs(message: string): number
 }
 
 interface SessionRow {
@@ -92,6 +94,11 @@ export function createStorage(db: AppDatabase): Storage {
         provider = excluded.provider,
         updated_at = excluded.updated_at
     `),
+    failStaleAnalysisJobs: db.prepare(`
+      UPDATE analysis_jobs
+      SET status = 'error', error = @error, updated_at = @updated_at
+      WHERE status = 'processing'
+    `),
   }
 
   // One transaction so a session can never survive its own transcript.
@@ -167,6 +174,16 @@ export function createStorage(db: AppDatabase): Storage {
         provider: job.provider ?? null,
         updated_at: new Date().toISOString(),
       })
+    },
+
+    // Analysis runs in this process, so anything still "processing" after a
+    // restart is dead — without this the client polls it forever.
+    failStaleAnalysisJobs(message) {
+      const result = statements.failStaleAnalysisJobs.run({
+        error: message,
+        updated_at: new Date().toISOString(),
+      })
+      return result.changes
     },
   }
 }

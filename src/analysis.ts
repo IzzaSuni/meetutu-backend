@@ -1,10 +1,14 @@
 import {
   callGeminiGatewayAI,
   callOpenRouterAI,
+  summarizeTranscriptWithGemini,
+  transcribeAudioSegmentWithGemini,
   uploadAudioToGeminiFiles,
   type AiAnalysisResult,
+  type GeminiUploadedFile,
 } from './ai-providers.js'
 import { AUDIO_CONTENT_TYPE, AUDIO_FILE_EXTENSION, UNTITLED_MEETING_TITLE } from './constants.js'
+import { findMp3FrameStart, planAudioSegments, type AudioSegment } from './segmentation.js'
 import type { AudioStorage } from './audio-storage.js'
 import type { Config } from './config.js'
 import type { Storage } from './storage.js'
@@ -30,12 +34,24 @@ export interface AnalysisRequest {
   openrouterKey?: string
 }
 
-export type AnalysisGenerator = (request: AnalysisRequest) => Promise<AiAnalysisResult>
+/** Coarse progress for a long job, so a client polling status can show more than a spinner. */
+export interface AnalysisProgress {
+  stage: 'transcribing' | 'summarizing'
+  completedSegments: number
+  totalSegments: number
+}
+
+export interface AnalysisHooks {
+  onProgress?: (progress: AnalysisProgress) => void
+}
+
+export type AnalysisGenerator = (request: AnalysisRequest, hooks?: AnalysisHooks) => Promise<AiAnalysisResult>
 
 export interface AnalysisStatus {
   status: AnalysisJobStatus | 'not_found'
   provider?: string
   error?: string
+  progress?: AnalysisProgress
   data?: { transcript: TranscriptItem[]; summary?: MeetingSummary; suggested_title?: string }
 }
 
@@ -64,7 +80,14 @@ export function createAnalysisRunner(deps: { storage: Storage; generate: Analysi
   async function run(request: AnalysisRequest): Promise<void> {
     const { sessionId, provider } = request
     try {
-      const result = await deps.generate(request)
+      const result = await deps.generate(request, {
+        // Progress is deliberately in-memory only: a restart kills the job
+        // anyway, so a durable progress row could only ever be misleading.
+        onProgress: (progress) => {
+          const job = jobs.get(sessionId)
+          if (job?.status === 'processing') jobs.set(sessionId, { ...job, progress })
+        },
+      })
 
       deps.storage.putTranscript(sessionId, result.transcript)
       deps.storage.putSummary(sessionId, result.summary)
@@ -145,6 +168,10 @@ export function createAnalysisRunner(deps: { storage: Storage; generate: Analysi
   }
 }
 
+function toArrayBuffer(bytes: Uint8Array): ArrayBuffer {
+  return bytes.buffer.slice(bytes.byteOffset, bytes.byteOffset + bytes.byteLength) as ArrayBuffer
+}
+
 /** Builds the Gemini analysis path: stream audio off disk, then ask for the transcript. */
 export function createGeminiGenerator(deps: {
   audio: AudioStorage
@@ -152,13 +179,28 @@ export function createGeminiGenerator(deps: {
   apiUrl?: string
   cfAigToken?: string
   inlineMaxBytes?: number
+  maxSegmentSeconds?: number
+  maxSegmentBytes?: number
 }): AnalysisGenerator {
   const inlineMaxBytes = deps.inlineMaxBytes ?? GEMINI_INLINE_AUDIO_MAX_BYTES
 
-  return async (request) => {
+  return async (request, hooks = {}) => {
     const layout = await deps.audio.getLayout(request.sessionId)
     if (!layout) {
       throw new Error('No audio recording found for this session yet.')
+    }
+
+    const segments = planAudioSegments({
+      totalBytes: layout.totalBytes,
+      durationSeconds: request.durationSeconds,
+      maxSegmentSeconds: deps.maxSegmentSeconds,
+      maxSegmentBytes: deps.maxSegmentBytes,
+    })
+
+    // A 90-120 minute meeting cannot be transcribed in one response, so it is
+    // transcribed segment by segment and summarized from the merged result.
+    if (segments.length > 1) {
+      return analyzeInSegments({ deps, inlineMaxBytes, layout, segments, request, hooks })
     }
 
     // Long recordings go through the Files API so their bytes are streamed to
@@ -178,8 +220,7 @@ export function createGeminiGenerator(deps: {
 
     let audioBuffer: ArrayBuffer | undefined
     if (!audioFile) {
-      const bytes = await deps.audio.readRange(layout, 0, layout.totalBytes)
-      audioBuffer = bytes.buffer.slice(bytes.byteOffset, bytes.byteOffset + bytes.byteLength) as ArrayBuffer
+      audioBuffer = toArrayBuffer(await deps.audio.readRange(layout, 0, layout.totalBytes))
     }
 
     return callGeminiGatewayAI({
@@ -196,6 +237,95 @@ export function createGeminiGenerator(deps: {
   }
 }
 
+/**
+ * Transcribes each segment in turn, then summarizes the merged transcript.
+ *
+ * Segments run sequentially on purpose: they are minutes of model time each,
+ * running them in parallel multiplies peak memory and invites rate limiting,
+ * and there is no deadline to race — the whole point of this backend is that a
+ * job may take as long as it takes.
+ */
+async function analyzeInSegments(params: {
+  deps: { audio: AudioStorage; apiKey: string; apiUrl?: string; cfAigToken?: string }
+  inlineMaxBytes: number
+  layout: Awaited<ReturnType<AudioStorage['getLayout']>>
+  segments: AudioSegment[]
+  request: AnalysisRequest
+  hooks: AnalysisHooks
+}): Promise<AiAnalysisResult> {
+  const { deps, layout, segments, request, hooks } = params
+  if (!layout) throw new Error('No audio recording found for this session yet.')
+
+  const transcript: TranscriptItem[] = []
+
+  for (const segment of segments) {
+    const raw = await deps.audio.readRange(layout, segment.byteOffset, segment.byteLength)
+    // A byte-boundary cut lands mid-frame; drop the partial frame at the front
+    // so the decoder on Google's side starts cleanly. The first segment starts
+    // at the real beginning of the file and is left alone.
+    const bytes = segment.index === 0 ? raw : raw.subarray(findMp3FrameStart(raw))
+
+    let audioFile: GeminiUploadedFile | undefined
+    let audioBuffer: ArrayBuffer | undefined
+    if (bytes.byteLength > params.inlineMaxBytes) {
+      const slice = toArrayBuffer(bytes)
+      audioFile = await uploadAudioToGeminiFiles({
+        apiKey: deps.apiKey,
+        cfAigToken: deps.cfAigToken,
+        byteLength: slice.byteLength,
+        mimeType: AUDIO_CONTENT_TYPE,
+        displayName: `meetutu-session-${request.sessionId}-part-${segment.index + 1}.${AUDIO_FILE_EXTENSION}`,
+        readChunk: async (offset, length) => new Uint8Array(slice, offset, length),
+      })
+    } else {
+      audioBuffer = toArrayBuffer(bytes)
+    }
+
+    // Say which part failed: with eight of them, "Gemini API error (403)" on
+    // its own leaves no way to tell a transient blip from a bad slice.
+    const items = await transcribeAudioSegmentWithGemini({
+      apiUrl: deps.apiUrl,
+      apiKey: deps.apiKey,
+      model: request.model,
+      cfAigToken: deps.cfAigToken,
+      audioBuffer,
+      audioFile,
+      segment,
+      segmentCount: segments.length,
+      customInstructions: request.customInstructions,
+    }).catch((error: unknown) => {
+      const message = error instanceof Error ? error.message : String(error)
+      throw new Error(
+        message.includes(`part ${segment.index + 1} of `)
+          ? message
+          : `Failed on part ${segment.index + 1} of ${segments.length} of the recording: ${message}`,
+      )
+    })
+    transcript.push(...items)
+
+    hooks.onProgress?.({
+      stage: 'transcribing',
+      completedSegments: segment.index + 1,
+      totalSegments: segments.length,
+    })
+  }
+
+  hooks.onProgress?.({ stage: 'summarizing', completedSegments: segments.length, totalSegments: segments.length })
+
+  const { summary, suggestedTitle } = await summarizeTranscriptWithGemini({
+    apiUrl: deps.apiUrl,
+    apiKey: deps.apiKey,
+    model: request.model,
+    cfAigToken: deps.cfAigToken,
+    title: request.title,
+    durationSeconds: request.durationSeconds,
+    transcript,
+    customInstructions: request.customInstructions,
+  })
+
+  return { transcript, summary, suggestedTitle }
+}
+
 /** Dispatches to the provider the request asked for. */
 export function createGenerator(deps: { audio: AudioStorage; config: Config }): AnalysisGenerator {
   const gemini = createGeminiGenerator({
@@ -205,7 +335,7 @@ export function createGenerator(deps: { audio: AudioStorage; config: Config }): 
     cfAigToken: deps.config.cfAigToken,
   })
 
-  return async (request) => {
+  return async (request, hooks) => {
     if (request.kind === 'openrouter') {
       if (!request.openrouterKey) {
         throw new Error('No OpenRouter API key configured.')
@@ -218,6 +348,6 @@ export function createGenerator(deps: { audio: AudioStorage; config: Config }): 
         customInstructions: request.customInstructions,
       })
     }
-    return gemini(request)
+    return gemini(request, hooks)
   }
 }

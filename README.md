@@ -18,6 +18,44 @@ state is written to SQLite so a restart or a second process still sees it, and
 audio over 6 MiB is streamed to the Gemini Files API in 8 MiB chunks so the
 server never holds a whole recording in memory.
 
+## Long meetings
+
+The target case is a **90-120 minute** meeting. At the 32 kbps mono the browser
+records, that is 21.6-28.8 MB of MP3 and 173k-230k Gemini input tokens (audio
+costs 32 tokens/second) — comfortably inside the model's ~1M input window.
+
+The *output* window is the real constraint: 65,536 tokens, and a verbatim
+two-hour transcript plus its summary lands in the same order of magnitude once
+every line carries `id`/`timestamp`/`seconds`/`speaker` JSON around it. So a
+recording longer than one segment is handled in pieces:
+
+1. `planAudioSegments` cuts the recording into ≤15-minute, ≤6 MiB slices —
+   byte offsets stand in for time offsets because the MP3 is constant-bitrate.
+   Two hours is eight segments.
+2. Each slice is transcribed on its own, sequentially, and its timestamps are
+   shifted into absolute meeting time here rather than trusting the model to do
+   the arithmetic. A slice that starts mid-frame is advanced to the next frame
+   header.
+3. The summary is generated once, from the merged transcript as text — the
+   audio is not re-sent.
+
+A truncated or blocked response is now reported as such (`finishReason`), and a
+failing segment says which one it was, instead of surfacing as an unexplained
+`JSON.parse` error after ten minutes of work.
+
+Two consequences for clients:
+
+- **Analysis of a two-hour meeting takes minutes, not seconds** (eight model
+  calls plus a summary). Poll `/analysis-status` with a generous timeout; a
+  five-minute client-side cap will give up while the job is still healthy.
+- While a segmented job runs, `/analysis-status` carries
+  `progress: { stage, completedSegments, totalSegments }` so the UI can show
+  more than a spinner.
+
+Chat over a long meeting keeps 200k characters of transcript in context, and
+trims from the middle rather than the end when it has to — decisions and action
+items live at the end of a meeting.
+
 ## Stack
 
 | Piece | Choice |
@@ -94,7 +132,7 @@ signed-in frontend keeps working after the cutover.
 | `GET` | `/api/recordings/:id/transcription` | Stored transcript |
 | `GET` | `/api/recordings/:id/summary` | Stored summary |
 | `POST` | `/api/recordings/:id/transcribe` | Start analysis → `202` |
-| `GET` | `/api/recordings/:id/analysis-status` | `processing` / `done` / `error` / `not_found` |
+| `GET` | `/api/recordings/:id/analysis-status` | `processing` / `done` / `error` / `not_found`, plus `progress` while segmenting |
 | `PATCH` | `/api/recordings/:id/action-items/:actionId` | Toggle an action item |
 | `POST` | `/api/recordings/:id/save-intelligence` | Store client-generated results |
 | `POST` | `/api/recordings/:id/chat` | Ask about the meeting |

@@ -1,4 +1,5 @@
 import { UNTITLED_MEETING_TITLE } from './constants.js'
+import type { AudioSegment } from './segmentation.js'
 import type { ChatTurn, MeetingSummary, TranscriptItem } from './types.js'
 
 // Official Google Generative Language API — no shared/community proxy.
@@ -22,7 +23,43 @@ interface GeminiCandidatePart {
 }
 
 interface GeminiResponse {
-  candidates?: Array<{ content?: { parts?: GeminiCandidatePart[] } }>
+  candidates?: Array<{ content?: { parts?: GeminiCandidatePart[] }; finishReason?: string }>
+}
+
+/** The output ceiling of gemini-3.x-flash. Asked for explicitly rather than left to the default. */
+export const GEMINI_MAX_OUTPUT_TOKENS = 65_536
+
+/**
+ * Pulls the text out of a candidate, turning a truncated or blocked response
+ * into a clear error. Without this a response cut off at the output limit
+ * arrives as half a JSON object and fails as an unexplained parse error after
+ * the caller has already spent minutes on the request.
+ */
+function readGeminiText(json: GeminiResponse, what: string): string {
+  const candidate = json.candidates?.[0]
+  const text = candidate?.content?.parts?.find((part) => part.text)?.text
+
+  if (candidate?.finishReason === 'MAX_TOKENS') {
+    throw new Error(
+      `Gemini hit its output limit while ${what}, so the response was cut off. The recording is too long to return in one piece.`,
+    )
+  }
+  if (!text) {
+    throw new Error(
+      candidate?.finishReason
+        ? `Empty response from Gemini API while ${what} (finishReason: ${candidate.finishReason})`
+        : 'Empty response from Gemini API',
+    )
+  }
+  return text
+}
+
+/** "MM:SS", counting past 59 minutes rather than wrapping, so timestamps stay sortable. */
+function formatTimestamp(totalSeconds: number): string {
+  const safe = Math.max(0, Math.round(totalSeconds))
+  const minutes = Math.floor(safe / 60)
+  const seconds = safe % 60
+  return `${String(minutes).padStart(2, '0')}:${String(seconds).padStart(2, '0')}`
 }
 
 interface OpenRouterResponse {
@@ -216,6 +253,34 @@ async function waitForActiveGeminiFile(params: {
   return { fileUri: params.file.uri, mimeType: mimeType || 'audio/mp3' }
 }
 
+// Shared by the single-shot analysis prompt and the summarize-a-merged-
+// transcript prompt so both paths describe the same summary shape.
+const SUMMARY_FIELDS_SPEC = `   - overview: Concise 2-3 sentence executive synopsis.
+   - key_points: Array of 3-6 specific bullet takeaways. Each is an object with "text" and "timestamps" — an array of { timestamp, seconds } pointing to every transcript moment that discusses this point (usually 1, sometimes more if it recurs).
+   - action_items: Array of objects with { id, task, assignee, status: "pending" | "completed", timestamps }, where timestamps follows the same { timestamp, seconds } format pointing to where the action was raised.
+   - decisions: Array of objects, same shape as key_points ({ text, timestamps }).
+   - sentiment: String describing overall tone (e.g. "Positive & Collaborative").`
+
+const SUMMARY_JSON_SCHEMA = `  "summary": {
+    "overview": "...",
+    "key_points": [
+      { "text": "...", "timestamps": [{ "timestamp": "00:12", "seconds": 12 }] }
+    ],
+    "action_items": [
+      { "id": "act-1", "task": "...", "assignee": "...", "status": "pending", "timestamps": [{ "timestamp": "00:45", "seconds": 45 }] }
+    ],
+    "decisions": [
+      { "text": "...", "timestamps": [{ "timestamp": "01:10", "seconds": 70 }] }
+    ],
+    "sentiment": "..."
+  }`
+
+function stripCodeFence(rawText: string): string {
+  const raw = rawText.trim()
+  if (!raw.startsWith('```')) return raw
+  return raw.replace(/^```(?:json)?\n?/, '').replace(/\n?```$/, '')
+}
+
 function buildAnalysisPrompt(params: {
   title: string
   durationSeconds: number
@@ -228,11 +293,7 @@ ${params.hasAudio ? 'Listen to this recorded audio file and transcribe all spoke
 Generate:
 1. Detailed chronological dialogue transcript segments with timestamps (e.g. "00:00", "00:15") and realistic speaker labels (e.g. "Speaker 1 (Host)", "Speaker 2 (Participant)").
 2. A structured executive meeting summary with:
-   - overview: Concise 2-3 sentence executive synopsis.
-   - key_points: Array of 3-6 specific bullet takeaways. Each is an object with "text" and "timestamps" — an array of { timestamp, seconds } pointing to every transcript moment that discusses this point (usually 1, sometimes more if it recurs).
-   - action_items: Array of objects with { id, task, assignee, status: "pending" | "completed", timestamps }, where timestamps follows the same { timestamp, seconds } format pointing to where the action was raised.
-   - decisions: Array of objects, same shape as key_points ({ text, timestamps }).
-   - sentiment: String describing overall tone (e.g. "Positive & Collaborative").
+${SUMMARY_FIELDS_SPEC}
 Every "seconds" value (in transcript and in summary timestamps) MUST be the actual integer second offset into the recording, and every "timestamp" string MUST be the matching "MM:SS" formatting of that same value.
 ${params.needsGeneratedTitle ? '3. A concise, specific meeting title (3-8 words) summarizing what was actually discussed — no generic placeholders.' : ''}
 ${params.customInstructions ? `\nThe user has given you these additional instructions for how to generate this summary — follow them closely, adjusting tone/focus/language/structure as asked, while still returning the exact JSON schema below:\n"""\n${params.customInstructions}\n"""\n` : ''}
@@ -245,29 +306,12 @@ You MUST return ONLY a JSON object matching this exact schema:
   "transcript": [
     { "id": "t-1", "timestamp": "00:00", "seconds": 0, "speaker": "Speaker 1 (Host)", "text": "..." }
   ],
-  "summary": {
-    "overview": "...",
-    "key_points": [
-      { "text": "...", "timestamps": [{ "timestamp": "00:12", "seconds": 12 }] }
-    ],
-    "action_items": [
-      { "id": "act-1", "task": "...", "assignee": "...", "status": "pending", "timestamps": [{ "timestamp": "00:45", "seconds": 45 }] }
-    ],
-    "decisions": [
-      { "text": "...", "timestamps": [{ "timestamp": "01:10", "seconds": 70 }] }
-    ],
-    "sentiment": "..."
-  }${params.needsGeneratedTitle ? ',\n  "suggested_title": "..."' : ''}
+${SUMMARY_JSON_SCHEMA}${params.needsGeneratedTitle ? ',\n  "suggested_title": "..."' : ''}
 }`
 }
 
 function parseAnalysisJson(rawText: string, source: 'Gemini' | 'OpenRouter'): AiAnalysisResult {
-  let raw = rawText.trim()
-  if (raw.startsWith('```')) {
-    raw = raw.replace(/^```(?:json)?\n?/, '').replace(/\n?```$/, '')
-  }
-
-  const parsed = JSON.parse(raw)
+  const parsed = JSON.parse(stripCodeFence(rawText))
   if (!parsed.transcript || !parsed.summary) {
     throw new Error(`${source} response did not match expected transcript/summary format`)
   }
@@ -380,17 +424,143 @@ export async function callGeminiGatewayAI(params: {
     headers: buildGeminiHeaders(params.apiKey, params.cfAigToken),
     body: JSON.stringify({
       contents: [{ parts }],
-      generationConfig: { responseMimeType: 'application/json' },
+      generationConfig: { responseMimeType: 'application/json', maxOutputTokens: GEMINI_MAX_OUTPUT_TOKENS },
     }),
   })
 
   const json = (await res.json()) as GeminiResponse
-  const candidate = json.candidates?.[0]?.content?.parts?.find((part) => part.text)?.text
-  if (!candidate) {
-    throw new Error('Empty response from Gemini API')
+  return parseAnalysisJson(readGeminiText(json, 'analyzing the meeting'), 'Gemini')
+}
+
+/**
+ * Transcribes one slice of a long recording.
+ *
+ * Segments are transcribed separately because a verbatim transcript of a
+ * 90-120 minute meeting does not fit in one response (see segmentation.ts).
+ * The model only hears this slice, so it numbers its timestamps from zero;
+ * they are shifted back into meeting time here rather than trusting the model
+ * to do the arithmetic.
+ */
+export async function transcribeAudioSegmentWithGemini(params: {
+  apiUrl?: string
+  apiKey: string
+  model?: string
+  cfAigToken?: string
+  audioBuffer?: ArrayBuffer
+  audioFile?: GeminiUploadedFile
+  segment: AudioSegment
+  segmentCount: number
+  customInstructions?: string
+}): Promise<TranscriptItem[]> {
+  const baseUrl = (params.apiUrl || DEFAULT_GEMINI_API_URL).replace(/\/$/, '')
+  const model = params.model || DEFAULT_GEMINI_MODEL
+  const { segment } = params
+
+  const prompt = `You are meetutu AI, transcribing part ${segment.index + 1} of ${params.segmentCount} of a longer meeting recording.
+Listen to this audio and transcribe all spoken dialogue verbatim, as chronological segments with timestamps and realistic speaker labels (e.g. "Speaker 1 (Host)", "Speaker 2 (Participant)").
+Keep speaker labels consistent with the numbering you would use for the whole meeting: the first voice you hear is "Speaker 1" unless the audio makes another mapping obvious.
+Timestamps must be relative to the START OF THIS AUDIO CLIP, beginning at 00:00 — do not try to account for earlier parts of the meeting.
+Transcribe only what is actually spoken. Do not summarize, and do not invent dialogue to fill silence.
+${params.customInstructions ? `\nThe user has asked for this transcript to follow these instructions where they apply to transcription (language, formatting, terminology):\n"""\n${params.customInstructions}\n"""\n` : ''}
+This clip is about ${segment.durationSeconds} seconds long.
+
+Return ONLY a JSON object matching this exact schema:
+{
+  "transcript": [
+    { "id": "t-1", "timestamp": "00:00", "seconds": 0, "speaker": "Speaker 1 (Host)", "text": "..." }
+  ]
+}`
+
+  const parts: Array<Record<string, unknown>> = [{ text: prompt }]
+  if (params.audioFile) {
+    parts.push({ fileData: { mimeType: params.audioFile.mimeType, fileUri: params.audioFile.fileUri } })
+  } else if (params.audioBuffer && params.audioBuffer.byteLength > 0) {
+    parts.push({ inlineData: { mimeType: 'audio/mp3', data: Buffer.from(params.audioBuffer).toString('base64') } })
   }
 
-  return parseAnalysisJson(candidate, 'Gemini')
+  const res = await fetchGeminiWithRetry(`${baseUrl}/models/${model}:generateContent`, {
+    method: 'POST',
+    headers: buildGeminiHeaders(params.apiKey, params.cfAigToken),
+    body: JSON.stringify({
+      contents: [{ parts }],
+      generationConfig: { responseMimeType: 'application/json', maxOutputTokens: GEMINI_MAX_OUTPUT_TOKENS },
+    }),
+  })
+
+  const json = (await res.json()) as GeminiResponse
+  const text = readGeminiText(json, `transcribing part ${segment.index + 1} of ${params.segmentCount}`)
+  const parsed = JSON.parse(stripCodeFence(text))
+  if (!Array.isArray(parsed.transcript)) {
+    throw new Error(`Gemini returned no transcript for part ${segment.index + 1} of ${params.segmentCount}`)
+  }
+
+  return (parsed.transcript as TranscriptItem[]).map((item, position) => {
+    const seconds = segment.startSeconds + Math.max(0, Number(item.seconds) || 0)
+    return {
+      ...item,
+      id: `t-${segment.index + 1}-${position + 1}`,
+      seconds,
+      timestamp: formatTimestamp(seconds),
+    }
+  })
+}
+
+/**
+ * Produces the executive summary from an already-merged transcript. Text only:
+ * the audio was heard during transcription, and re-sending two hours of it
+ * would cost another ~230k input tokens for no extra information.
+ */
+export async function summarizeTranscriptWithGemini(params: {
+  apiUrl?: string
+  apiKey: string
+  model?: string
+  cfAigToken?: string
+  title: string
+  durationSeconds: number
+  transcript: TranscriptItem[]
+  customInstructions?: string
+}): Promise<{ summary: MeetingSummary; suggestedTitle?: string }> {
+  const baseUrl = (params.apiUrl || DEFAULT_GEMINI_API_URL).replace(/\/$/, '')
+  const model = params.model || DEFAULT_GEMINI_MODEL
+  const needsGeneratedTitle = !params.title || params.title === UNTITLED_MEETING_TITLE
+
+  const transcriptText = params.transcript
+    .map((item) => `[${item.timestamp} | ${item.seconds}s] ${item.speaker}: ${item.text}`)
+    .join('\n')
+
+  const prompt = `You are meetutu AI, a world-class executive meeting intelligence engine.
+Below is the full verbatim transcript of a meeting, with the exact second offset of every line. Produce a structured executive summary of it.
+${SUMMARY_FIELDS_SPEC}
+Every "seconds" value MUST be copied from the transcript lines you are citing, and every "timestamp" string MUST be the matching "MM:SS" formatting of that same value.
+${needsGeneratedTitle ? 'Also produce a concise, specific meeting title (3-8 words) summarizing what was actually discussed — no generic placeholders.' : ''}
+${params.customInstructions ? `\nThe user has given you these additional instructions — follow them closely, adjusting tone/focus/language/structure as asked, while still returning the exact JSON schema below:\n"""\n${params.customInstructions}\n"""\n` : ''}
+
+Meeting Title: ${params.title || '(not provided — generate one from the actual content)'}
+Duration: ${params.durationSeconds || 30} seconds
+
+## Transcript
+${transcriptText}
+
+Return ONLY a JSON object matching this exact schema:
+{
+${SUMMARY_JSON_SCHEMA}${needsGeneratedTitle ? ',\n  "suggested_title": "..."' : ''}
+}`
+
+  const res = await fetchGeminiWithRetry(`${baseUrl}/models/${model}:generateContent`, {
+    method: 'POST',
+    headers: buildGeminiHeaders(params.apiKey, params.cfAigToken),
+    body: JSON.stringify({
+      contents: [{ parts: [{ text: prompt }] }],
+      generationConfig: { responseMimeType: 'application/json', maxOutputTokens: GEMINI_MAX_OUTPUT_TOKENS },
+    }),
+  })
+
+  const json = (await res.json()) as GeminiResponse
+  const parsed = JSON.parse(stripCodeFence(readGeminiText(json, 'summarizing the meeting')))
+  if (!parsed.summary) {
+    throw new Error('Gemini response did not include a summary')
+  }
+  return { summary: parsed.summary as MeetingSummary, suggestedTitle: parsed.suggested_title }
 }
 
 function buildChatSystemPrompt(params: { title: string; transcriptText: string; summaryText: string }): string {

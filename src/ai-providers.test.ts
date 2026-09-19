@@ -1,9 +1,12 @@
 import { describe, it, expect, vi, afterEach } from 'vitest'
 import {
+  GEMINI_MAX_OUTPUT_TOKENS,
   GEMINI_UPLOAD_CHUNK_BYTES,
   callGeminiChat,
   callGeminiGatewayAI,
   fetchGeminiWithRetry,
+  summarizeTranscriptWithGemini,
+  transcribeAudioSegmentWithGemini,
   uploadAudioToGeminiFiles,
 } from './ai-providers.js'
 
@@ -260,5 +263,148 @@ describe('callGeminiChat', () => {
         message: 'hi',
       })
     ).rejects.toThrow(/Empty response/)
+  })
+})
+
+describe('output-token truncation', () => {
+  it('reports a truncated analysis instead of failing on malformed JSON', async () => {
+    // Arrange: Gemini stops mid-object when the transcript outgrows the cap.
+    globalThis.fetch = vi.fn().mockResolvedValue(
+      jsonResponse({
+        candidates: [
+          { finishReason: 'MAX_TOKENS', content: { parts: [{ text: '{"transcript":[{"id":"t-1"' }] } },
+        ],
+      }),
+    ) as unknown as typeof fetch
+
+    // Act / Assert
+    await expect(
+      callGeminiGatewayAI({ apiKey: 'k', title: 'Sync', durationSeconds: 7200 }),
+    ).rejects.toThrow(/output limit/i)
+  })
+
+  it('surfaces a non-STOP finish reason that returned no text at all', async () => {
+    globalThis.fetch = vi
+      .fn()
+      .mockResolvedValue(jsonResponse({ candidates: [{ finishReason: 'SAFETY', content: { parts: [] } }] })) as unknown as typeof fetch
+
+    await expect(callGeminiGatewayAI({ apiKey: 'k', title: 'Sync', durationSeconds: 60 })).rejects.toThrow(/SAFETY/)
+  })
+
+  it('asks for the full output budget', async () => {
+    const fetchMock = vi.fn().mockResolvedValue(jsonResponse(geminiCandidate(AI_RESULT)))
+    globalThis.fetch = fetchMock as unknown as typeof fetch
+
+    await callGeminiGatewayAI({ apiKey: 'k', title: 'Sync', durationSeconds: 60 })
+
+    const body = JSON.parse((fetchMock.mock.calls[0][1] as RequestInit).body as string)
+    expect(body.generationConfig.maxOutputTokens).toBe(GEMINI_MAX_OUTPUT_TOKENS)
+  })
+})
+
+describe('transcribeAudioSegmentWithGemini', () => {
+  const segmentAudio = () => new Uint8Array([1, 2, 3]).buffer as ArrayBuffer
+
+  it('shifts segment timestamps by the segment offset', async () => {
+    // Arrange: the model numbers each segment from zero; the merged transcript
+    // has to be in absolute meeting time.
+    globalThis.fetch = vi.fn().mockResolvedValue(
+      jsonResponse(
+        geminiCandidate({
+          transcript: [
+            { id: 't-1', timestamp: '00:10', seconds: 10, speaker: 'Speaker 1', text: 'Second segment.' },
+          ],
+        }),
+      ),
+    ) as unknown as typeof fetch
+
+    // Act
+    const items = await transcribeAudioSegmentWithGemini({
+      apiKey: 'k',
+      audioBuffer: segmentAudio(),
+      segment: { index: 1, byteOffset: 0, byteLength: 3, startSeconds: 900, durationSeconds: 900 },
+      segmentCount: 2,
+    })
+
+    // Assert
+    expect(items).toEqual([
+      { id: 't-2-1', timestamp: '15:10', seconds: 910, speaker: 'Speaker 1', text: 'Second segment.' },
+    ])
+  })
+
+  it('formats hour-long offsets as total minutes so timestamps stay sortable', async () => {
+    globalThis.fetch = vi.fn().mockResolvedValue(
+      jsonResponse(
+        geminiCandidate({
+          transcript: [{ id: 't-1', timestamp: '00:05', seconds: 5, speaker: 'Speaker 2', text: 'Late.' }],
+        }),
+      ),
+    ) as unknown as typeof fetch
+
+    const items = await transcribeAudioSegmentWithGemini({
+      apiKey: 'k',
+      audioBuffer: segmentAudio(),
+      segment: { index: 7, byteOffset: 0, byteLength: 3, startSeconds: 6300, durationSeconds: 900 },
+      segmentCount: 8,
+    })
+
+    expect(items[0]).toMatchObject({ seconds: 6305, timestamp: '105:05' })
+  })
+
+  it('rejects a segment response that is missing its transcript', async () => {
+    globalThis.fetch = vi
+      .fn()
+      .mockResolvedValue(jsonResponse(geminiCandidate({ notes: 'nothing here' }))) as unknown as typeof fetch
+
+    await expect(
+      transcribeAudioSegmentWithGemini({
+        apiKey: 'k',
+        audioBuffer: segmentAudio(),
+        segment: { index: 0, byteOffset: 0, byteLength: 3, startSeconds: 0, durationSeconds: 900 },
+        segmentCount: 2,
+      }),
+    ).rejects.toThrow(/transcript/i)
+  })
+})
+
+describe('summarizeTranscriptWithGemini', () => {
+  const transcript = [{ id: 't-1', timestamp: '00:00', seconds: 0, speaker: 'Speaker 1', text: 'Ship on Friday.' }]
+
+  it('summarizes from transcript text without re-sending the audio', async () => {
+    // Arrange
+    const fetchMock = vi.fn().mockResolvedValue(
+      jsonResponse(
+        geminiCandidate({
+          summary: { overview: 'Ship talk.', key_points: [], action_items: [], decisions: [], sentiment: 'Positive' },
+          suggested_title: 'Ship Decision',
+        }),
+      ),
+    )
+    globalThis.fetch = fetchMock as unknown as typeof fetch
+
+    // Act
+    const result = await summarizeTranscriptWithGemini({
+      apiKey: 'k',
+      title: '',
+      durationSeconds: 7200,
+      transcript,
+    })
+
+    // Assert
+    expect(result.summary.overview).toBe('Ship talk.')
+    expect(result.suggestedTitle).toBe('Ship Decision')
+    const body = (fetchMock.mock.calls[0][1] as RequestInit).body as string
+    expect(body).toContain('Ship on Friday.')
+    expect(body).not.toContain('inlineData')
+  })
+
+  it('rejects a response with no summary object', async () => {
+    globalThis.fetch = vi
+      .fn()
+      .mockResolvedValue(jsonResponse(geminiCandidate({ suggested_title: 'Only a title' }))) as unknown as typeof fetch
+
+    await expect(
+      summarizeTranscriptWithGemini({ apiKey: 'k', title: 'Sync', durationSeconds: 60, transcript }),
+    ).rejects.toThrow(/summary/i)
   })
 })

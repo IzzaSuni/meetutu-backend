@@ -293,3 +293,201 @@ describe('gemini generator', () => {
     expect(result.transcript).toHaveLength(1)
   })
 })
+
+describe('long-meeting segmentation', () => {
+  let dir: string
+  let audio: AudioStorage
+  const originalFetch = globalThis.fetch
+
+  beforeEach(() => {
+    dir = mkdtempSync(join(tmpdir(), 'meetutu-segments-'))
+    audio = createAudioStorage(join(dir, 'audio'))
+  })
+
+  afterEach(() => {
+    globalThis.fetch = originalFetch
+    rmSync(dir, { recursive: true, force: true })
+  })
+
+  const jsonOk = (payload: unknown) =>
+    new Response(JSON.stringify({ candidates: [{ content: { parts: [{ text: JSON.stringify(payload) }] } }] }), {
+      status: 200,
+      headers: { 'Content-Type': 'application/json' },
+    })
+
+  // A two-hour recording at the 32 kbps the recorder produces, shrunk by a
+  // factor of 1000 so the test stays fast; the segment caps are scaled to match.
+  const TWO_HOURS = 7200
+  const RECORDING_BYTES = 2880
+
+  async function putRecording(bytes = RECORDING_BYTES): Promise<void> {
+    const audioBytes = new Uint8Array(bytes)
+    // A frame header at the head of every 360-byte slice, so alignment is a no-op.
+    for (let i = 0; i < bytes; i += 360) {
+      audioBytes[i] = 0xff
+      audioBytes[i + 1] = 0xfb
+    }
+    await audio.putPart(1, 1, audioBytes)
+  }
+
+  function segmentedGenerator() {
+    return createGeminiGenerator({
+      audio,
+      apiKey: 'key',
+      apiUrl: 'https://gemini.test/v1beta',
+      maxSegmentSeconds: 900,
+      maxSegmentBytes: 400,
+    })
+  }
+
+  it('transcribes a long recording in segments and summarizes once', async () => {
+    // Arrange
+    const bodies: string[] = []
+    globalThis.fetch = vi.fn(async (_url: string | URL, init?: RequestInit) => {
+      const body = String(init?.body ?? '')
+      bodies.push(body)
+      if (body.includes('"inlineData"')) {
+        return jsonOk({
+          transcript: [{ id: 't-1', timestamp: '00:05', seconds: 5, speaker: 'Speaker 1', text: 'Part.' }],
+        })
+      }
+      return jsonOk({
+        summary: { overview: 'Long meeting.', key_points: [], action_items: [], decisions: [] },
+        suggested_title: 'Quarterly Planning',
+      })
+    }) as unknown as typeof fetch
+    await putRecording()
+
+    // Act
+    const result = await segmentedGenerator()(request({ durationSeconds: TWO_HOURS }), {})
+
+    // Assert
+    const transcriptionCalls = bodies.filter((body) => body.includes('"inlineData"'))
+    expect(transcriptionCalls).toHaveLength(8)
+    expect(result.transcript).toHaveLength(8)
+    expect(result.summary.overview).toBe('Long meeting.')
+    expect(result.suggestedTitle).toBe('Quarterly Planning')
+  })
+
+  it('merges segment transcripts into one rising timeline', async () => {
+    globalThis.fetch = vi.fn(async (_url: string | URL, init?: RequestInit) => {
+      const body = String(init?.body ?? '')
+      if (body.includes('"inlineData"')) {
+        return jsonOk({
+          transcript: [{ id: 't-1', timestamp: '00:05', seconds: 5, speaker: 'Speaker 1', text: 'Part.' }],
+        })
+      }
+      return jsonOk({ summary: { overview: 'ok', key_points: [], action_items: [], decisions: [] } })
+    }) as unknown as typeof fetch
+    await putRecording()
+
+    const result = await segmentedGenerator()(request({ durationSeconds: TWO_HOURS }), {})
+
+    expect(result.transcript.map((item) => item.seconds)).toEqual([5, 905, 1805, 2705, 3605, 4505, 5405, 6305])
+    expect(result.transcript[7].timestamp).toBe('105:05')
+    expect(new Set(result.transcript.map((item) => item.id)).size).toBe(8)
+  })
+
+  it('summarizes from the merged transcript rather than re-sending the audio', async () => {
+    let summaryBody = ''
+    globalThis.fetch = vi.fn(async (_url: string | URL, init?: RequestInit) => {
+      const body = String(init?.body ?? '')
+      if (body.includes('"inlineData"')) {
+        return jsonOk({
+          transcript: [{ id: 't-1', timestamp: '00:05', seconds: 5, speaker: 'Speaker 1', text: 'Budget approved.' }],
+        })
+      }
+      summaryBody = body
+      return jsonOk({ summary: { overview: 'ok', key_points: [], action_items: [], decisions: [] } })
+    }) as unknown as typeof fetch
+    await putRecording()
+
+    await segmentedGenerator()(request({ durationSeconds: TWO_HOURS }), {})
+
+    expect(summaryBody).toContain('Budget approved.')
+    expect(summaryBody).not.toContain('inlineData')
+  })
+
+  it('reports segment progress while it works', async () => {
+    globalThis.fetch = vi.fn(async (_url: string | URL, init?: RequestInit) => {
+      const body = String(init?.body ?? '')
+      if (body.includes('"inlineData"')) {
+        return jsonOk({ transcript: [] })
+      }
+      return jsonOk({ summary: { overview: 'ok', key_points: [], action_items: [], decisions: [] } })
+    }) as unknown as typeof fetch
+    await putRecording()
+
+    const updates: string[] = []
+    await segmentedGenerator()(request({ durationSeconds: TWO_HOURS }), {
+      onProgress: (progress) => updates.push(`${progress.stage} ${progress.completedSegments}/${progress.totalSegments}`),
+    })
+
+    expect(updates[0]).toBe('transcribing 1/8')
+    expect(updates.at(-1)).toBe('summarizing 8/8')
+  })
+
+  it('keeps the single-request path for a short meeting', async () => {
+    const bodies: string[] = []
+    globalThis.fetch = vi.fn(async (_url: string | URL, init?: RequestInit) => {
+      bodies.push(String(init?.body ?? ''))
+      return jsonOk({
+        transcript: [{ id: 't-1', timestamp: '00:00', seconds: 0, speaker: 'Speaker 1', text: 'Hi.' }],
+        summary: { overview: 'Short.', key_points: [], action_items: [], decisions: [] },
+      })
+    }) as unknown as typeof fetch
+    await putRecording(360)
+
+    const result = await segmentedGenerator()(request({ durationSeconds: 90 }), {})
+
+    expect(bodies).toHaveLength(1)
+    expect(result.summary.overview).toBe('Short.')
+  })
+
+  it('uploads an oversized segment through the Files API instead of inlining it', async () => {
+    const urls: string[] = []
+    globalThis.fetch = vi.fn(async (url: string | URL, init?: RequestInit) => {
+      const href = String(url)
+      urls.push(href)
+      if (href.endsWith('/upload/v1beta/files')) {
+        return new Response('{}', { status: 200, headers: { 'x-goog-upload-url': 'https://upload.test/s' } })
+      }
+      if (href === 'https://upload.test/s') {
+        return new Response(
+          JSON.stringify({ file: { name: 'files/a', uri: 'https://files.test/a', mimeType: 'audio/mpeg', state: 'ACTIVE' } }),
+          { status: 200, headers: { 'Content-Type': 'application/json' } },
+        )
+      }
+      const body = String(init?.body ?? '')
+      if (body.includes('"fileData"')) return jsonOk({ transcript: [] })
+      return jsonOk({ summary: { overview: 'ok', key_points: [], action_items: [], decisions: [] } })
+    }) as unknown as typeof fetch
+    await putRecording()
+
+    const generate = createGeminiGenerator({
+      audio,
+      apiKey: 'key',
+      apiUrl: 'https://gemini.test/v1beta',
+      maxSegmentSeconds: 900,
+      maxSegmentBytes: 400,
+      inlineMaxBytes: 100,
+    })
+    await generate(request({ durationSeconds: TWO_HOURS }), {})
+
+    expect(urls.filter((url) => url.endsWith('/upload/v1beta/files'))).toHaveLength(8)
+  })
+
+  it('names the failing segment when one of them errors', async () => {
+    let call = 0
+    globalThis.fetch = vi.fn(async (_url: string | URL, init?: RequestInit) => {
+      call++
+      if (call === 3) return new Response('kaboom', { status: 403 })
+      const body = String(init?.body ?? '')
+      if (body.includes('"inlineData"')) return jsonOk({ transcript: [] })
+      return jsonOk({ summary: { overview: 'ok', key_points: [], action_items: [], decisions: [] } })
+    }) as unknown as typeof fetch
+    await putRecording()
+
+    await expect(segmentedGenerator()(request({ durationSeconds: TWO_HOURS }), {})).rejects.toThrow(/part 3 of 8/)
+  })
+})

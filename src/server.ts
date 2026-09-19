@@ -12,6 +12,17 @@ function main(): void {
   const dataDir = resolve(config.dataDir)
 
   const storage = createStorage(openDatabase(join(dataDir, 'meetutu.db')))
+
+  // Jobs live in this process. Anything still "processing" belongs to a
+  // previous life of it and will never finish, so say so instead of leaving
+  // the client polling a ghost.
+  const reaped = storage.failStaleAnalysisJobs(
+    'The server restarted while this meeting was being analyzed. Run the analysis again.',
+  )
+  if (reaped > 0) {
+    console.warn(`failed ${reaped} analysis job(s) left processing by a previous run`)
+  }
+
   const audio = createAudioStorage(join(dataDir, 'audio'))
   const analysis = createAnalysisRunner({ storage, generate: createGenerator({ audio, config }) })
   const app = createApp({ config, storage, audio, analysis })

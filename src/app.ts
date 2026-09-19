@@ -10,6 +10,7 @@ import {
 import type { AnalysisRequest, AnalysisRunner } from './analysis.js'
 import type { AudioStorage } from './audio-storage.js'
 import { computeAuthToken, tokensMatch } from './auth.js'
+import { buildTranscriptContext } from './chat-context.js'
 import type { Config } from './config.js'
 import { AUDIO_CONTENT_TYPE, UNTITLED_MEETING_TITLE } from './constants.js'
 import type { Storage } from './storage.js'
@@ -27,7 +28,6 @@ const PUBLIC_API_PATHS = new Set(['/api/health', '/api/auth/login'])
 const MAX_CUSTOM_INSTRUCTION_CHARS = 500
 const MAX_CHAT_MESSAGE_CHARS = 2000
 const MAX_CHAT_HISTORY_TURNS = 20
-const MAX_CHAT_CONTEXT_CHARS = 12000
 
 interface RequestBody {
   [key: string]: unknown
@@ -441,10 +441,7 @@ export function createApp(deps: AppDeps): Hono {
           .map((turn) => ({ role: turn.role, content: String(turn.content).slice(0, MAX_CHAT_MESSAGE_CHARS) }))
       : []
 
-    const transcriptText = transcript
-      .map((item) => `[${item.timestamp}] ${item.speaker}: ${item.text}`)
-      .join('\n')
-      .slice(0, MAX_CHAT_CONTEXT_CHARS)
+    const transcriptText = buildTranscriptContext(transcript)
     const summaryText = buildSummaryText(summary)
     const title = session?.title || UNTITLED_MEETING_TITLE
     const providerPreference = c.req.header('X-AI-Provider') || str(body.provider) || 'gemini-gateway'

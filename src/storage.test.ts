@@ -113,3 +113,39 @@ describe('storage (SQLite-backed)', () => {
     expect(reopened.getSession(1)).toEqual(baseSession)
   })
 })
+
+describe('stale analysis jobs', () => {
+  let dir: string
+  let storage: Storage
+
+  beforeEach(() => {
+    dir = mkdtempSync(join(tmpdir(), 'meetutu-stale-'))
+    storage = createStorage(openDatabase(join(dir, 'test.db')))
+  })
+
+  afterEach(() => {
+    rmSync(dir, { recursive: true, force: true })
+  })
+
+  it('marks jobs left processing by a restart as failed', () => {
+    // Arrange: an in-process job cannot survive the process it ran in.
+    storage.putAnalysisJob(1, { status: 'processing', provider: 'gemini (test)' })
+    storage.putAnalysisJob(2, { status: 'done', provider: 'gemini (test)' })
+
+    // Act
+    const reaped = storage.failStaleAnalysisJobs('Server restarted during analysis.')
+
+    // Assert
+    expect(reaped).toBe(1)
+    expect(storage.getAnalysisJob(1)).toMatchObject({
+      status: 'error',
+      error: 'Server restarted during analysis.',
+    })
+    expect(storage.getAnalysisJob(2)?.status).toBe('done')
+  })
+
+  it('reports zero when there is nothing to reap', () => {
+    // Act / Assert
+    expect(storage.failStaleAnalysisJobs('Server restarted during analysis.')).toBe(0)
+  })
+})
