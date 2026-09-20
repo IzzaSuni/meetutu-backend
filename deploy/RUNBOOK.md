@@ -12,6 +12,23 @@ Placeholders to substitute throughout:
 | `FRONTEND_ORIGIN` | `https://meetutu.example.workers.dev` | Exact origin serving the SPA, no trailing slash |
 | `VPS_USER` | `ubuntu` | Login user on the VPS |
 
+## Fast path: one script
+
+`deploy/bootstrap.sh` does every step below — installs Docker and Caddy, clones
+the repo, writes `.env`, starts the container, binds the domain with automatic
+TLS, and verifies health and CORS. On a fresh Debian/Ubuntu VPS:
+
+```bash
+curl -fsSL https://raw.githubusercontent.com/IzzaSuni/meetutu-backend/main/deploy/bootstrap.sh -o bootstrap.sh
+API_DOMAIN=api.example.com FRONTEND_ORIGIN=https://app.example.com bash bootstrap.sh
+```
+
+It prompts for the login password and the OpenRouter key (hidden input, so
+neither lands in the shell history). Re-running it is the update path: pull,
+rebuild, restart, leaving `.env` and the data volume untouched.
+
+Read on for what it does step by step, or to do it by hand.
+
 ## 0. Prerequisites
 
 - A VPS with 1 GB RAM / 1 vCPU (enough — see README) and ports 80 and 443 open.
