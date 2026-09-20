@@ -17,6 +17,8 @@ set -euo pipefail
 REPO_URL="https://github.com/IzzaSuni/meetutu-backend.git"
 APP_DIR="${APP_DIR:-$HOME/meetutu-backend}"
 CADDYFILE="/etc/caddy/Caddyfile"
+SITE_DIR="/etc/caddy/conf.d"
+SITE_IMPORT="import $SITE_DIR/*.caddy"
 # An audio part is uploaded as a single body, well past Caddy's 10 MB default.
 MAX_UPLOAD="512MB"
 
@@ -114,7 +116,23 @@ install_docker() {
   $SUDO systemctl enable --now docker
 }
 
+# Names the process already listening on :443, empty if nothing is. A VPS that
+# already serves another site is the normal case, and quietly taking its port
+# (or its config file) away from it would take that site down.
+port443_owner() {
+  $SUDO ss -tlnpH 2>/dev/null | awk '$4 ~ /:443$/' | grep -oE '"[^"]+"' | head -1 | tr -d '"'
+}
+
 install_caddy() {
+  local owner
+  owner="$(port443_owner)"
+
+  if [ -n "$owner" ] && [ "$owner" != "caddy" ]; then
+    die "port 443 is already served by '$owner'. Add a vhost for $API_DOMAIN to it
+       pointing at 127.0.0.1:8787 (deploy/nginx.conf.example is a working
+       template), or stop it first. The container is unaffected either way."
+  fi
+
   if command -v caddy >/dev/null; then
     echo "Caddy is already installed"
     return
@@ -181,7 +199,11 @@ start_stack() {
 
 configure_caddy() {
   log "Binding $API_DOMAIN to the container"
-  $SUDO tee "$CADDYFILE" >/dev/null <<EOF
+
+  # Our site goes in its own file under conf.d and the main Caddyfile only gains
+  # an import line, so a Caddy that is already serving other sites keeps them.
+  $SUDO mkdir -p "$SITE_DIR"
+  $SUDO tee "$SITE_DIR/meetutu.caddy" >/dev/null <<EOF
 $API_DOMAIN {
 	request_body {
 		max_size $MAX_UPLOAD
@@ -189,7 +211,20 @@ $API_DOMAIN {
 	reverse_proxy 127.0.0.1:8787
 }
 EOF
+
+  if [ -f "$CADDYFILE" ] && ! grep -qF "$SITE_IMPORT" "$CADDYFILE"; then
+    $SUDO cp "$CADDYFILE" "$CADDYFILE.bak-$(date +%Y%m%d%H%M%S)"
+    printf '\n%s\n' "$SITE_IMPORT" | $SUDO tee -a "$CADDYFILE" >/dev/null
+    echo "Appended '$SITE_IMPORT' to $CADDYFILE (original backed up)"
+  elif [ ! -f "$CADDYFILE" ]; then
+    printf '%s\n' "$SITE_IMPORT" | $SUDO tee "$CADDYFILE" >/dev/null
+  fi
+
   $SUDO systemctl enable --now caddy
+  # validate before reload: a broken config would otherwise drop every site on
+  # this host, not just ours.
+  $SUDO caddy validate --config "$CADDYFILE" --adapter caddyfile >/dev/null ||
+    die "the Caddy config does not validate — nothing was reloaded, check $CADDYFILE"
   $SUDO systemctl reload caddy
 }
 
