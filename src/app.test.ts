@@ -551,4 +551,137 @@ describe('meetutu backend app', () => {
       expect(res.status).toBe(400)
     })
   })
+
+  describe('usage', () => {
+    const openrouterConfig: Config = { ...config, aiProvider: 'openrouter', openrouterApiKey: 'or-key' }
+
+    const keyPayload = {
+      data: {
+        label: 'sk-or-v1-e29...245',
+        limit: 3,
+        limit_remaining: 2.74341375,
+        usage: 0.25658625,
+        usage_daily: 0.1,
+        usage_weekly: 0.2,
+        usage_monthly: 0.25658625,
+        is_free_tier: false,
+        expires_at: null,
+      },
+    }
+    const creditsPayload = { data: { total_credits: 5, total_usage: 0.25711213 } }
+
+    const ok = (payload: unknown) =>
+      new Response(JSON.stringify(payload), { status: 200, headers: { 'Content-Type': 'application/json' } })
+
+    function stubOpenRouter(overrides: { key?: Response; credits?: Response } = {}): () => string[] {
+      const urls: string[] = []
+      globalThis.fetch = vi.fn(async (url: string | URL) => {
+        const href = String(url)
+        urls.push(href)
+        if (href.endsWith('/credits')) return (overrides.credits ?? ok(creditsPayload)).clone()
+        return (overrides.key ?? ok(keyPayload)).clone()
+      }) as unknown as typeof fetch
+      return () => urls
+    }
+
+    it('requires a token', async () => {
+      const res = await app.request('/api/usage')
+      expect(res.status).toBe(401)
+    })
+
+    it('reports spend and quota for the configured OpenRouter key', async () => {
+      stubOpenRouter()
+      const usageApp = createApp({ config: openrouterConfig, storage, audio, analysis })
+
+      const res = await usageApp.request('/api/usage', { headers: auth })
+      const body = (await res.json()) as any
+
+      expect(res.status).toBe(200)
+      expect(body.data.provider).toBe('openrouter')
+      expect(body.data.model).toBe('google/gemini-3.8-flash')
+      expect(body.data.key).toMatchObject({
+        label: 'sk-or-v1-e29...245',
+        spend: 0.25658625,
+        limit: 3,
+        remaining: 2.74341375,
+        isFreeTier: false,
+      })
+      expect(body.data.credits).toEqual({ granted: 5, spend: 0.25711213, remaining: 5 - 0.25711213 })
+      expect(body.data.unavailable).toBeNull()
+    })
+
+    it('never puts the API key itself in the response', async () => {
+      stubOpenRouter()
+      const usageApp = createApp({ config: openrouterConfig, storage, audio, analysis })
+
+      const res = await usageApp.request('/api/usage', { headers: auth })
+
+      expect(await res.text()).not.toContain('or-key')
+    })
+
+    it('counts the meetings and audio the backend has analyzed', async () => {
+      stubOpenRouter()
+      storage.putSession({
+        id: 1,
+        title: 'Analyzed',
+        status: 'completed',
+        duration: 600,
+        created_at: '2026-09-20T00:00:00.000Z',
+        parts_count: 1,
+        audio_url: '/api/recordings/1/audio',
+        has_transcription: true,
+        has_summary: true,
+      })
+      storage.putSession({
+        id: 2,
+        title: 'Not analyzed yet',
+        status: 'completed',
+        duration: 300,
+        created_at: '2026-09-20T01:00:00.000Z',
+        parts_count: 1,
+        audio_url: '/api/recordings/2/audio',
+      })
+      const usageApp = createApp({ config: openrouterConfig, storage, audio, analysis })
+
+      const body = (await (await usageApp.request('/api/usage', { headers: auth })).json()) as any
+
+      expect(body.data.meetings).toEqual({ total: 2, analyzed: 1, audioSeconds: 900 })
+    })
+
+    // The local half of the dashboard is still worth showing when OpenRouter
+    // is unreachable — and the reason belongs on screen, not in a 502 the page
+    // can only render as "failed to load".
+    it('still answers with local counts when OpenRouter cannot be reached', async () => {
+      vi.spyOn(console, 'error').mockImplementation(() => {})
+      stubOpenRouter({ key: new Response('down', { status: 503 }) })
+      const usageApp = createApp({ config: openrouterConfig, storage, audio, analysis })
+
+      const body = (await (await usageApp.request('/api/usage', { headers: auth })).json()) as any
+
+      expect(body.success).toBe(true)
+      expect(body.data.key).toBeNull()
+      expect(body.data.unavailable).toMatch(/503/)
+      expect(body.data.meetings.total).toBe(0)
+    })
+
+    // Google publishes no spend or quota API, so there is nothing to show but
+    // the truth about why.
+    it('says so when the configured provider reports no usage at all', async () => {
+      const body = (await (await app.request('/api/usage', { headers: auth })).json()) as any
+
+      expect(body.data.provider).toBe('gemini')
+      expect(body.data.key).toBeNull()
+      expect(body.data.unavailable).toMatch(/gemini/i)
+    })
+
+    it('keeps the key stats when only the credits call fails', async () => {
+      stubOpenRouter({ credits: new Response('nope', { status: 403 }) })
+      const usageApp = createApp({ config: openrouterConfig, storage, audio, analysis })
+
+      const body = (await (await usageApp.request('/api/usage', { headers: auth })).json()) as any
+
+      expect(body.data.key.spend).toBe(0.25658625)
+      expect(body.data.credits).toBeNull()
+    })
+  })
 })

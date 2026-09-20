@@ -185,6 +185,14 @@ signed-in frontend keeps working after the cutover.
 | `POST` | `/api/recordings/:id/chat` | Ask about the meeting |
 | `POST` | `/api/ai/gemini-test` | Gemini connectivity check |
 | `POST` | `/api/ai/verify-key` | OpenRouter key check |
+| `GET` | `/api/usage` | AI spend, key limit and account credits, plus local meeting counts |
+
+`/api/usage` reads OpenRouter's own `auth/key` and `credits` endpoints with the
+server's key and returns only numbers and the masked label OpenRouter itself
+publishes — the key never reaches the browser. If OpenRouter cannot be reached
+the call still succeeds with the local counts and an `unavailable` reason, so
+the dashboard degrades to half a page instead of an error. On a Gemini deploy
+`unavailable` explains that Google publishes no equivalent API.
 
 ## Deploying to a VPS
 

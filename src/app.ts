@@ -15,6 +15,7 @@ import type { Config } from './config.js'
 import { AUDIO_CONTENT_TYPE, UNTITLED_MEETING_TITLE } from './constants.js'
 import type { Storage } from './storage.js'
 import type { ChatTurn, MeetingSession, MeetingSummary, SummaryItem } from './types.js'
+import { fetchOpenRouterUsage, summarizeMeetings } from './usage.js'
 
 export interface AppDeps {
   config: Config
@@ -528,6 +529,57 @@ export function createApp(deps: AppDeps): Hono {
     } catch (error: unknown) {
       const errorMessage = error instanceof Error ? error.message : 'Failed to reach Gemini API'
       return c.json({ success: false, error: errorMessage }, 500)
+    }
+  })
+
+  /**
+   * What the AI has cost so far and how much room is left, for the usage
+   * dashboard. The key never leaves the server: the client gets the numbers
+   * and OpenRouter's own masked label, nothing it could spend with.
+   */
+  app.get('/api/usage', async (c) => {
+    const meetings = summarizeMeetings(storage.listSessions())
+
+    if (config.aiProvider !== 'openrouter' || !config.openrouterApiKey) {
+      return c.json({
+        success: true,
+        data: {
+          provider: config.aiProvider,
+          model: config.aiProvider === 'gemini' ? config.geminiModel : config.openrouterModel,
+          key: null,
+          credits: null,
+          meetings,
+          // Google's API answers questions about models, not about money.
+          unavailable:
+            config.aiProvider === 'gemini'
+              ? 'Gemini publishes no spend or quota API — check billing in Google AI Studio.'
+              : 'No OpenRouter API key is configured on this server.',
+        },
+      })
+    }
+
+    try {
+      const usage = await fetchOpenRouterUsage(config.openrouterApiKey)
+      return c.json({
+        success: true,
+        data: {
+          provider: 'openrouter',
+          model: config.openrouterModel,
+          key: usage.key,
+          credits: usage.credits,
+          meetings,
+          unavailable: null,
+        },
+      })
+    } catch (error: unknown) {
+      // Partial data beats an error page: the meeting counts are local and
+      // still true, and the reason the rest is missing belongs on screen.
+      const message = error instanceof Error ? error.message : 'Failed to read usage from OpenRouter'
+      console.error('[meetutu usage error]', error)
+      return c.json({
+        success: true,
+        data: { provider: 'openrouter', model: config.openrouterModel, key: null, credits: null, meetings, unavailable: message },
+      })
     }
   })
 
