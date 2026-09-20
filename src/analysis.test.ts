@@ -10,6 +10,7 @@ import {
   createGeminiGenerator,
   createGenerator,
   createOpenRouterGenerator,
+  SEGMENT_ATTEMPTS,
   type AnalysisRequest,
 } from './analysis.js'
 import { UNTITLED_MEETING_TITLE } from './constants.js'
@@ -388,6 +389,71 @@ describe('openrouter generator', () => {
     const generate = createOpenRouterGenerator({ audio })
 
     await expect(generate(request({ kind: 'openrouter' }))).rejects.toThrow(/OpenRouter API key/i)
+  })
+
+  // A provider that dies mid-generation answers 200 with finish_reason "error"
+  // and either no content or half a JSON object. Observed on a real 19-minute
+  // recording: part 2 of 5 failed that way twice while the same slice
+  // transcribed fine on the next attempt.
+  const orUnusable = (content?: string) =>
+    new Response(JSON.stringify({ choices: [{ finish_reason: 'error', message: { content } }] }), {
+      status: 200,
+      headers: { 'Content-Type': 'application/json' },
+    })
+
+  const transcribed = { transcript: [{ id: 't-1', timestamp: '00:01', seconds: 1, speaker: 'Andi', text: 'Hi.' }] }
+
+  async function runWithAudioResponses(responses: Response[]): Promise<{
+    result: Promise<{ transcript: unknown[] }>
+    audioCalls: () => number
+  }> {
+    let audioCalls = 0
+    globalThis.fetch = vi.fn(async (_url: string | URL, init?: RequestInit) => {
+      if (!String(init?.body).includes('input_audio')) return orOk({ summary: aiResult.summary })
+      const response = responses[Math.min(audioCalls, responses.length - 1)]
+      audioCalls++
+      return response.clone()
+    }) as unknown as typeof fetch
+
+    await audio.putPart(1, 1, new Uint8Array([0xff, 0xfb, 0, 0]))
+    const generate = createOpenRouterGenerator({ audio })
+    return {
+      result: generate(request({ kind: 'openrouter', openrouterKey: 'or-key' })),
+      audioCalls: () => audioCalls,
+    }
+  }
+
+  it('retries a segment whose response came back empty', async () => {
+    const { result, audioCalls } = await runWithAudioResponses([orUnusable(), orOk(transcribed)])
+
+    expect((await result).transcript).toHaveLength(1)
+    expect(audioCalls()).toBe(2)
+  })
+
+  it('retries a segment whose JSON came back truncated', async () => {
+    const truncated = new Response(
+      JSON.stringify({ choices: [{ finish_reason: 'error', message: { content: '{"transcript": [{"text": "cut' } }] }),
+      { status: 200, headers: { 'Content-Type': 'application/json' } }
+    )
+    const { result, audioCalls } = await runWithAudioResponses([truncated, orOk(transcribed)])
+
+    expect((await result).transcript).toHaveLength(1)
+    expect(audioCalls()).toBe(2)
+  })
+
+  it('gives up on a segment that stays unusable, naming the part', async () => {
+    const { result, audioCalls } = await runWithAudioResponses([orUnusable()])
+
+    await expect(result).rejects.toThrow(/part 1 of 1/)
+    expect(audioCalls()).toBe(SEGMENT_ATTEMPTS)
+  })
+
+  it('does not retry a rejected request — a bad key stays bad', async () => {
+    const rejected = new Response('{"error":{"message":"No auth credentials found"}}', { status: 401 })
+    const { result, audioCalls } = await runWithAudioResponses([rejected])
+
+    await expect(result).rejects.toThrow(/401/)
+    expect(audioCalls()).toBe(1)
   })
 })
 

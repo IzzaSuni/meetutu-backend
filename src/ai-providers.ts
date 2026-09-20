@@ -36,6 +36,24 @@ interface GeminiResponse {
 export const GEMINI_MAX_OUTPUT_TOKENS = 65_536
 
 /**
+ * The request was accepted and billed, but what came back cannot be used: no
+ * content at all, or content that is not the JSON it was asked for. A provider
+ * that fails mid-generation reports it this way — HTTP 200, `finish_reason:
+ * "error"`, and either an empty message or half a JSON object — so the status
+ * code gives the caller nothing to go on.
+ *
+ * Distinct from every other failure here because it is the one worth trying
+ * again: the same audio and the same prompt usually succeed on the next
+ * attempt, where a rejected key or an oversized response never will.
+ */
+export class UnusableModelResponseError extends Error {
+  constructor(message: string) {
+    super(message)
+    this.name = 'UnusableModelResponseError'
+  }
+}
+
+/**
  * Pulls the text out of a candidate, turning a truncated or blocked response
  * into a clear error. Without this a response cut off at the output limit
  * arrives as half a JSON object and fails as an unexplained parse error after
@@ -51,7 +69,7 @@ function readGeminiText(json: GeminiResponse, what: string): string {
     )
   }
   if (!text) {
-    throw new Error(
+    throw new UnusableModelResponseError(
       candidate?.finishReason
         ? `Empty response from Gemini API while ${what} (finishReason: ${candidate.finishReason})`
         : 'Empty response from Gemini API',
@@ -93,7 +111,7 @@ function readOpenRouterText(json: OpenRouterResponse, what: string): string {
 
   const content = choice?.message?.content
   if (!content) {
-    throw new Error(
+    throw new UnusableModelResponseError(
       choice?.finish_reason
         ? `Empty response from OpenRouter while ${what} (finish_reason: ${choice.finish_reason})`
         : 'Empty response from OpenRouter AI',
@@ -416,9 +434,21 @@ Return ONLY a JSON object matching this exact schema:
  * trusting the model to do arithmetic it cannot check.
  */
 function parseSegmentTranscript(rawText: string, segment: AudioSegment, segmentCount: number): TranscriptItem[] {
-  const parsed = JSON.parse(stripCodeFence(rawText))
+  const partLabel = `part ${segment.index + 1} of ${segmentCount}`
+
+  // A generation that dies partway through still returns HTTP 200 with the
+  // prefix it managed to produce, so the break surfaces here as a parse error
+  // rather than as anything the response envelope admitted to.
+  let parsed: { transcript?: unknown }
+  try {
+    parsed = JSON.parse(stripCodeFence(rawText))
+  } catch (error) {
+    const message = error instanceof Error ? error.message : String(error)
+    throw new UnusableModelResponseError(`Malformed transcript JSON for ${partLabel}: ${message}`)
+  }
+
   if (!Array.isArray(parsed.transcript)) {
-    throw new Error(`No transcript returned for part ${segment.index + 1} of ${segmentCount}`)
+    throw new UnusableModelResponseError(`No transcript returned for ${partLabel}`)
   }
 
   return (parsed.transcript as TranscriptItem[]).map((item, position) => {

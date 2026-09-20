@@ -4,6 +4,7 @@ import {
   transcribeAudioSegmentWithGemini,
   transcribeAudioSegmentWithOpenRouter,
   uploadAudioToGeminiFiles,
+  UnusableModelResponseError,
   type AiAnalysisResult,
   type GeminiUploadedFile,
   type TranscriptAnalysis,
@@ -358,6 +359,38 @@ export function createOpenRouterGenerator(deps: {
 /** How many trailing lines of the previous segment to show the model for continuity. */
 const CONTINUITY_LINES = 3
 
+/**
+ * Attempts per segment when the provider answers with something unusable.
+ *
+ * Segments are sequential and each one is paid for, so a single mid-generation
+ * failure on part 2 of 5 used to throw away the parts already transcribed and
+ * end the job. Three attempts because the failure is a provider hiccup: it
+ * either clears immediately or is not going to.
+ */
+export const SEGMENT_ATTEMPTS = 3
+const SEGMENT_RETRY_BASE_DELAY_MS = 500
+
+const sleep = (ms: number) => new Promise((resolve) => setTimeout(resolve, ms))
+
+/**
+ * One segment, retried only for the failure that a retry can fix. A rejected
+ * key, a missing slice or a response past the output ceiling comes straight
+ * back out — trying those again just spends more money to fail the same way.
+ */
+async function transcribeSegmentWithRetry(
+  steps: PipelineSteps,
+  input: Parameters<PipelineSteps['transcribeSegment']>[0],
+): Promise<TranscriptItem[]> {
+  for (let attempt = 1; ; attempt++) {
+    try {
+      return await steps.transcribeSegment(input)
+    } catch (error) {
+      if (!(error instanceof UnusableModelResponseError) || attempt >= SEGMENT_ATTEMPTS) throw error
+      await sleep(SEGMENT_RETRY_BASE_DELAY_MS * attempt)
+    }
+  }
+}
+
 function renderContinuity(transcript: TranscriptItem[]): string | undefined {
   if (transcript.length === 0) return undefined
   return transcript
@@ -397,7 +430,7 @@ async function transcribeRecording(params: {
 
     // Say which part failed: with eight of them, "API error (403)" on its own
     // leaves no way to tell a transient blip from a bad slice.
-    const items = await steps.transcribeSegment({
+    const items = await transcribeSegmentWithRetry(steps, {
       request,
       bytes,
       segment,
