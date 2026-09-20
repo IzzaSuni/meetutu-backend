@@ -501,9 +501,16 @@ export interface TranscriptAnalysis {
 }
 
 function parseTranscriptAnalysis(rawText: string, source: 'Gemini' | 'OpenRouter'): TranscriptAnalysis {
-  const parsed = JSON.parse(stripCodeFence(rawText))
+  let parsed: { summary?: unknown; suggested_title?: string }
+  try {
+    parsed = JSON.parse(stripCodeFence(rawText))
+  } catch (error) {
+    const message = error instanceof Error ? error.message : String(error)
+    throw new UnusableModelResponseError(`Malformed summary JSON from ${source}: ${message}`)
+  }
+
   if (!parsed.summary) {
-    throw new Error(`${source} response did not include a summary`)
+    throw new UnusableModelResponseError(`${source} response did not include a summary`)
   }
   return { summary: parsed.summary as MeetingSummary, suggestedTitle: parsed.suggested_title }
 }

@@ -234,7 +234,9 @@ function createPipelineGenerator(deps: {
       totalSegments: segments.length,
     })
 
-    const { summary, suggestedTitle } = await deps.steps.analyzeTranscript({ request, transcript })
+    const { summary, suggestedTitle } = await withModelRetry(() =>
+      deps.steps.analyzeTranscript({ request, transcript }),
+    )
     return { transcript, summary, suggestedTitle }
   }
 }
@@ -360,33 +362,31 @@ export function createOpenRouterGenerator(deps: {
 const CONTINUITY_LINES = 3
 
 /**
- * Attempts per segment when the provider answers with something unusable.
+ * Attempts per model call when the provider answers with something unusable.
  *
- * Segments are sequential and each one is paid for, so a single mid-generation
- * failure on part 2 of 5 used to throw away the parts already transcribed and
- * end the job. Three attempts because the failure is a provider hiccup: it
- * either clears immediately or is not going to.
+ * Every call in a job is sequential and separately paid for, so one
+ * mid-generation failure — on part 2 of 5, or on the summary that follows all
+ * five — used to throw away everything the job had already produced. Three
+ * attempts because this failure is a provider hiccup: it either clears
+ * immediately or is not going to.
  */
-export const SEGMENT_ATTEMPTS = 3
-const SEGMENT_RETRY_BASE_DELAY_MS = 500
+export const MODEL_ATTEMPTS = 3
+const MODEL_RETRY_BASE_DELAY_MS = 500
 
 const sleep = (ms: number) => new Promise((resolve) => setTimeout(resolve, ms))
 
 /**
- * One segment, retried only for the failure that a retry can fix. A rejected
- * key, a missing slice or a response past the output ceiling comes straight
- * back out — trying those again just spends more money to fail the same way.
+ * Runs one step, retried only for the failure a retry can fix. A rejected key,
+ * a missing slice or a response past the output ceiling comes straight back
+ * out — trying those again just spends more money to fail the same way.
  */
-async function transcribeSegmentWithRetry(
-  steps: PipelineSteps,
-  input: Parameters<PipelineSteps['transcribeSegment']>[0],
-): Promise<TranscriptItem[]> {
+async function withModelRetry<T>(step: () => Promise<T>): Promise<T> {
   for (let attempt = 1; ; attempt++) {
     try {
-      return await steps.transcribeSegment(input)
+      return await step()
     } catch (error) {
-      if (!(error instanceof UnusableModelResponseError) || attempt >= SEGMENT_ATTEMPTS) throw error
-      await sleep(SEGMENT_RETRY_BASE_DELAY_MS * attempt)
+      if (!(error instanceof UnusableModelResponseError) || attempt >= MODEL_ATTEMPTS) throw error
+      await sleep(MODEL_RETRY_BASE_DELAY_MS * attempt)
     }
   }
 }
@@ -430,14 +430,16 @@ async function transcribeRecording(params: {
 
     // Say which part failed: with eight of them, "API error (403)" on its own
     // leaves no way to tell a transient blip from a bad slice.
-    const items = await transcribeSegmentWithRetry(steps, {
-      request,
-      bytes,
-      segment,
-      segmentCount: segments.length,
-      knownSpeakers: speakers,
-      precedingContext: renderContinuity(transcript),
-    }).catch((error: unknown) => {
+    const items = await withModelRetry(() =>
+      steps.transcribeSegment({
+        request,
+        bytes,
+        segment,
+        segmentCount: segments.length,
+        knownSpeakers: speakers,
+        precedingContext: renderContinuity(transcript),
+      }),
+    ).catch((error: unknown) => {
       const message = error instanceof Error ? error.message : String(error)
       throw new Error(
         message.includes(`part ${segment.index + 1} of `)

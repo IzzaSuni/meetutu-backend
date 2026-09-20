@@ -10,7 +10,7 @@ import {
   createGeminiGenerator,
   createGenerator,
   createOpenRouterGenerator,
-  SEGMENT_ATTEMPTS,
+  MODEL_ATTEMPTS,
   type AnalysisRequest,
 } from './analysis.js'
 import { UNTITLED_MEETING_TITLE } from './constants.js'
@@ -445,7 +445,33 @@ describe('openrouter generator', () => {
     const { result, audioCalls } = await runWithAudioResponses([orUnusable()])
 
     await expect(result).rejects.toThrow(/part 1 of 1/)
-    expect(audioCalls()).toBe(SEGMENT_ATTEMPTS)
+    expect(audioCalls()).toBe(MODEL_ATTEMPTS)
+  })
+
+  // Step 2 fails the same way step 1 does: the transcript of a 19-minute
+  // recording came back complete, then the summary arrived as 461 characters
+  // of a JSON object that stops mid-string.
+  it('retries the summary step when its JSON comes back truncated', async () => {
+    let summaryCalls = 0
+    globalThis.fetch = vi.fn(async (_url: string | URL, init?: RequestInit) => {
+      if (String(init?.body).includes('input_audio')) return orOk(transcribed)
+      summaryCalls++
+      if (summaryCalls === 1) {
+        return new Response(
+          JSON.stringify({ choices: [{ finish_reason: 'error', message: { content: '{"summary": {"overview": "cut' } }] }),
+          { status: 200, headers: { 'Content-Type': 'application/json' } }
+        )
+      }
+      return orOk({ summary: aiResult.summary })
+    }) as unknown as typeof fetch
+
+    await audio.putPart(1, 1, new Uint8Array([0xff, 0xfb, 0, 0]))
+    const generate = createOpenRouterGenerator({ audio })
+
+    const result = await generate(request({ kind: 'openrouter', openrouterKey: 'or-key' }))
+
+    expect(result.summary.overview).toBe('A sync.')
+    expect(summaryCalls).toBe(2)
   })
 
   it('does not retry a rejected request — a bad key stays bad', async () => {
