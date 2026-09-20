@@ -1,11 +1,15 @@
 #!/usr/bin/env bash
 #
-# One command to stand the backend up on a fresh Debian/Ubuntu VPS: installs
-# Docker and Caddy, clones the repo, writes .env, starts the container, binds
-# the domain with automatic TLS, and verifies the result.
+# One command to stand the backend up on a fresh Debian/Ubuntu VPS: installs the
+# runtime and Caddy, clones the repo, writes .env, starts the server, binds the
+# domain with automatic TLS, and verifies the result.
+#
+# It runs the server in Docker where Docker works, and natively under pm2 where
+# it does not — many cheap "VPSes" are themselves containers. RUNTIME=docker or
+# RUNTIME=node overrides that choice.
 #
 # Re-running it is the update path — it pulls, rebuilds, and restarts while
-# leaving the existing .env and the data volume alone.
+# leaving the existing .env and the data alone.
 #
 #   curl -fsSL https://raw.githubusercontent.com/IzzaSuni/meetutu-backend/main/deploy/bootstrap.sh -o bootstrap.sh
 #   API_DOMAIN=api.example.com FRONTEND_ORIGIN=https://app.example.com bash bootstrap.sh
@@ -16,6 +20,10 @@ set -euo pipefail
 
 REPO_URL="https://github.com/IzzaSuni/meetutu-backend.git"
 APP_DIR="${APP_DIR:-$HOME/meetutu-backend}"
+SERVICE_NAME="meetutu-backend"
+# auto | docker | node. Plenty of cheap "VPSes" are themselves containers, where
+# Docker cannot run; auto notices that and installs the server natively.
+RUNTIME="${RUNTIME:-auto}"
 CADDYFILE="/etc/caddy/Caddyfile"
 SITE_DIR="/etc/caddy/conf.d"
 SITE_IMPORT="import $SITE_DIR/*.caddy"
@@ -117,6 +125,59 @@ check_dns() {
   else
     echo "$API_DOMAIN -> $resolved"
   fi
+}
+
+# Names the containerization this host runs under, or "none" on real hardware
+# or a full VM.
+detect_container() {
+  if [ -f /.dockerenv ]; then
+    echo docker
+    return
+  fi
+  if command -v systemd-detect-virt >/dev/null; then
+    local virt
+    virt="$(systemd-detect-virt --container 2>/dev/null || true)"
+    if [ -n "$virt" ] && [ "$virt" != none ]; then
+      echo "$virt"
+      return
+    fi
+  fi
+  if grep -qaE '(docker|lxc|containerd)' /proc/1/cgroup 2>/dev/null; then
+    echo container
+  else
+    echo none
+  fi
+}
+
+choose_runtime() {
+  if [ "$RUNTIME" = auto ]; then
+    local virt
+    virt="$(detect_container)"
+    if [ "$virt" != none ] && ! $SUDO docker info >/dev/null 2>&1; then
+      warn "this host is itself a $virt container, where Docker generally cannot run — installing the server natively instead (set RUNTIME=docker to insist)"
+      RUNTIME=node
+    else
+      RUNTIME=docker
+    fi
+  fi
+
+  case "$RUNTIME" in
+    # In Docker, 0.0.0.0 is the container's own network and compose publishes it
+    # on 127.0.0.1 only. Natively there is no such wrapper, so binding 0.0.0.0
+    # would expose the plain-HTTP API on :8787 to the internet, next to the TLS
+    # one Caddy serves. Only the loopback interface should be listening.
+    docker)
+      DATA_DIR=/data
+      BIND_HOST=0.0.0.0
+      ;;
+    node)
+      DATA_DIR="${DATA_DIR:-$APP_DIR/data}"
+      BIND_HOST=127.0.0.1
+      ;;
+    *) die "RUNTIME must be auto, docker or node (got '$RUNTIME')" ;;
+  esac
+
+  log "Runtime: $RUNTIME"
 }
 
 DOCKERD_LOG="/var/log/dockerd.log"
@@ -239,6 +300,9 @@ write_env() {
     if ! grep -q "^CORS_ORIGINS=$FRONTEND_ORIGIN$" "$env_file"; then
       warn "CORS_ORIGINS in .env does not match $FRONTEND_ORIGIN — update it if the frontend moved"
     fi
+    if [ "$RUNTIME" = node ] && grep -q '^HOST=0\.0\.0\.0$' "$env_file"; then
+      warn "HOST=0.0.0.0 in .env exposes the plain-HTTP API on :8787 to the internet — set HOST=127.0.0.1 so only Caddy can reach it"
+    fi
     return
   fi
 
@@ -256,11 +320,22 @@ OPENROUTER_API_KEY=$OPENROUTER_API_KEY
 AI_PROVIDER=openrouter
 OPENROUTER_MODEL=google/gemini-3.8-flash
 PORT=8787
-HOST=0.0.0.0
-DATA_DIR=/data
+HOST=$BIND_HOST
+DATA_DIR=$DATA_DIR
 CORS_ORIGINS=$FRONTEND_ORIGIN
 EOF
   chmod 600 "$env_file"
+}
+
+# Reads .env into the environment without sourcing it, so a password containing
+# spaces or shell metacharacters survives intact.
+load_env() {
+  local line key
+  while IFS= read -r line || [ -n "$line" ]; do
+    case "$line" in '' | \#*) continue ;; esac
+    key="${line%%=*}"
+    export "$key=${line#*=}"
+  done <"$APP_DIR/.env"
 }
 
 start_stack() {
@@ -268,8 +343,64 @@ start_stack() {
   (cd "$APP_DIR" && $SUDO docker compose up -d --build)
 }
 
+install_node() {
+  local major=0
+  command -v node >/dev/null && major="$(node -p 'process.versions.node.split(".")[0]' 2>/dev/null || echo 0)"
+  if [ "$major" -ge 22 ]; then
+    echo "Node $(node -v) is already installed"
+  else
+    log "Installing Node 22"
+    curl -fsSL https://deb.nodesource.com/setup_22.x | $SUDO -E bash -
+    $SUDO apt-get install -y -qq nodejs
+  fi
+
+  # pnpm-workspace.yaml grants better-sqlite3 permission to run its build script
+  # with the `allowBuilds` key, which only pnpm 12 understands. An older pnpm
+  # ignores it, skips the build, and the server then dies on a missing binding.
+  local pnpm_major=0
+  command -v pnpm >/dev/null && pnpm_major="$(pnpm --version 2>/dev/null | cut -d. -f1)"
+  if [ "${pnpm_major:-0}" -lt 12 ]; then
+    log "Installing pnpm 12"
+    $SUDO npm install -g pnpm@12 >/dev/null
+  fi
+
+  command -v pm2 >/dev/null || $SUDO npm install -g pm2 >/dev/null
+  # better-sqlite3 compiles from source whenever no prebuilt binary matches.
+  $SUDO apt-get install -y -qq python3 make g++
+}
+
+start_native() {
+  log "Building the server"
+  (cd "$APP_DIR" && pnpm install --frozen-lockfile && pnpm build)
+
+  mkdir -p "$DATA_DIR"
+  load_env
+
+  log "Starting it under pm2"
+  # --update-env re-reads the environment we just loaded, so an .env edit takes
+  # effect on the next run of this script rather than needing a manual delete.
+  if pm2 describe "$SERVICE_NAME" >/dev/null 2>&1; then
+    (cd "$APP_DIR" && pm2 restart "$SERVICE_NAME" --update-env)
+  else
+    (cd "$APP_DIR" && pm2 start dist/server.js --name "$SERVICE_NAME" --update-env)
+  fi
+  pm2 save >/dev/null
+
+  # pm2's own startup integration needs systemd; on a container host cron is
+  # what is left to bring it back after a reboot.
+  if [ "$HAS_SYSTEMD" -eq 1 ]; then
+    $SUDO env PATH="$PATH" pm2 startup systemd -u "$USER" --hp "$HOME" >/dev/null || true
+  elif ! crontab -l 2>/dev/null | grep -q 'pm2 resurrect'; then
+    (
+      crontab -l 2>/dev/null
+      echo "@reboot $(command -v pm2) resurrect"
+    ) | crontab -
+    echo "Added an @reboot pm2 resurrect entry"
+  fi
+}
+
 configure_caddy() {
-  log "Binding $API_DOMAIN to the container"
+  log "Binding $API_DOMAIN to the API on 127.0.0.1:8787"
 
   # Our site goes in its own file under conf.d and the main Caddyfile only gains
   # an import line, so a Caddy that is already serving other sites keeps them.
@@ -309,23 +440,40 @@ EOF
   else
     $SUDO caddy start --config "$CADDYFILE" --adapter caddyfile
   fi
-  warn "no systemd here, so neither Caddy nor the Docker daemon survives a reboot. Persist both with:
+
+  # The app itself is already handled: pm2 gets an @reboot entry, and the
+  # container has restart: unless-stopped. Only the pieces below are left.
+  if [ "$RUNTIME" = docker ]; then
+    warn "no systemd here, so neither Caddy nor the Docker daemon survives a reboot. Persist both with:
        (crontab -l 2>/dev/null
         echo '@reboot dockerd >>$DOCKERD_LOG 2>&1 &'
         echo '@reboot caddy start --config $CADDYFILE --adapter caddyfile') | crontab -
        The container itself restarts on its own once dockerd is back."
+  else
+    warn "no systemd here, so Caddy does not survive a reboot. Persist it with:
+       (crontab -l 2>/dev/null
+        echo '@reboot caddy start --config $CADDYFILE --adapter caddyfile') | crontab -
+       The API itself is already covered by the @reboot pm2 resurrect entry."
+  fi
 }
 
 verify() {
   log "Verifying"
 
+  local logs_hint
+  if [ "$RUNTIME" = docker ]; then
+    logs_hint="$SUDO docker compose -f $APP_DIR/docker-compose.yml logs"
+  else
+    logs_hint="pm2 logs $SERVICE_NAME --lines 50"
+  fi
+
   local attempt
   for attempt in $(seq 1 20); do
     if curl -fsS --max-time 5 http://127.0.0.1:8787/api/health >/dev/null; then
-      echo "container: healthy"
+      echo "local API: healthy"
       break
     fi
-    [ "$attempt" -eq 20 ] && die "the container never answered /api/health — check: $SUDO docker compose -f $APP_DIR/docker-compose.yml logs"
+    [ "$attempt" -eq 20 ] && die "the API never answered /api/health — check: $logs_hint"
     sleep 3
   done
 
@@ -336,7 +484,9 @@ verify() {
       echo "https://$API_DOMAIN: healthy"
       break
     fi
-    [ "$attempt" -eq 20 ] && die "no answer over HTTPS — check DNS and: $SUDO journalctl -u caddy -n 50"
+    local caddy_hint="$SUDO journalctl -u caddy -n 50"
+    [ "$HAS_SYSTEMD" -eq 1 ] || caddy_hint="$SUDO tail -n 50 /var/log/caddy/*.log (or the terminal caddy start wrote to)"
+    [ "$attempt" -eq 20 ] && die "no answer over HTTPS — check DNS and: $caddy_hint"
     sleep 5
   done
 
@@ -358,17 +508,40 @@ main() {
   require_debian
   collect_settings
   check_dns
-  install_docker
+  choose_runtime
+
+  if [ "$RUNTIME" = docker ]; then
+    install_docker
+  else
+    install_node
+  fi
+
   install_caddy
   sync_repo
   write_env
-  start_stack
+
+  if [ "$RUNTIME" = docker ]; then
+    start_stack
+  else
+    start_native
+  fi
+
   configure_caddy
   verify
 
+  local day_to_day
+  if [ "$RUNTIME" = docker ]; then
+    day_to_day="  $SUDO docker compose logs -f     # what the pipeline is doing
+  $SUDO docker compose restart     # after editing .env"
+  else
+    day_to_day="  pm2 logs $SERVICE_NAME           # what the pipeline is doing
+  pm2 restart $SERVICE_NAME        # after editing .env
+  pm2 status                       # uptime, restarts, memory"
+  fi
+
   cat <<EOF
 
-$(printf '\033[1;32mDone.\033[0m') The API is live at https://$API_DOMAIN
+$(printf '\033[1;32mDone.\033[0m') The API is live at https://$API_DOMAIN (runtime: $RUNTIME, data in $DATA_DIR)
 
 Point the frontend at it, in the meetutu (frontend) repo:
 
@@ -377,8 +550,7 @@ Point the frontend at it, in the meetutu (frontend) repo:
 
 Day to day, from $APP_DIR:
 
-  $SUDO docker compose logs -f     # what the pipeline is doing
-  $SUDO docker compose restart     # after editing .env
+$day_to_day
   bash deploy/bootstrap.sh         # pull, rebuild, restart
 
 EOF

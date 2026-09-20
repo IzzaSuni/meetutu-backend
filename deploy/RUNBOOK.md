@@ -31,7 +31,8 @@ Read on for what it does step by step, or to do it by hand.
 
 ## 0. Prerequisites
 
-- A VPS with 1 GB RAM / 1 vCPU (enough — see README) and ports 80 and 443 open.
+- A VPS with 1 GB RAM / 1 vCPU (enough — see README) and ports 80 and 443 open,
+  or a Cloudflare tunnel out of it (see step 4).
 - A DNS **A record** for `API_DOMAIN` pointing at the VPS IP. TLS is not
   optional: the SPA is served over HTTPS, and a browser refuses to call a
   plain-HTTP backend from an HTTPS page.
@@ -84,10 +85,43 @@ docker compose logs -f --tail=50     # Ctrl-C to stop following
 It binds to `127.0.0.1:8787`, so it is not reachable from outside until the
 reverse proxy in step 4 is up. Data lives in the `meetutu-data` volume.
 
-### systemd (alternative)
+### Native Node under systemd (no Docker)
 
-See the "systemd" section of the README; the unit file is
-`deploy/meetutu-backend.service` and it may only write to `DATA_DIR`.
+Plenty of cheap "VPSes" are themselves containers, where Docker cannot run.
+`bootstrap.sh` detects that and switches to this path on its own; `RUNTIME=node`
+forces it, `RUNTIME=docker` insists on the container. By hand, with the unit
+file from `deploy/meetutu-backend.service`:
+
+```bash
+sudo useradd --system --no-create-home --shell /usr/sbin/nologin meetutu
+sudo install -d -o meetutu -g meetutu -m 750 /var/lib/meetutu
+sudo git clone https://github.com/IzzaSuni/meetutu-backend.git /opt/meetutu-backend
+cd /opt/meetutu-backend && sudo pnpm install --frozen-lockfile && sudo pnpm build
+
+sudo install -m 600 /dev/stdin /etc/meetutu-backend.env <<'EOF'
+AUTH_USERNAME=admin
+AUTH_PASSWORD=<a new strong password>
+AI_PROVIDER=openrouter
+OPENROUTER_API_KEY=sk-or-v1-...
+OPENROUTER_MODEL=google/gemini-3.8-flash
+PORT=8787
+HOST=127.0.0.1
+DATA_DIR=/var/lib/meetutu
+CORS_ORIGINS=https://meetutu.my.id
+EOF
+
+sudo install -m 644 deploy/meetutu-backend.service /etc/systemd/system/
+sudo systemctl daemon-reload && sudo systemctl enable --now meetutu-backend
+curl -sS http://127.0.0.1:8787/api/health
+```
+
+The unit is sandboxed (`ProtectSystem=strict`, `ProtectHome=true`) and may only
+write `/var/lib/meetutu`, so `DATA_DIR` has to stay inside it. `journalctl -u
+meetutu-backend -f` is the log; `HOST=127.0.0.1` keeps the port private until
+something in step 4 fronts it.
+
+Without systemd (a container host), `bootstrap.sh` uses pm2 plus an `@reboot
+pm2 resurrect` crontab entry instead.
 
 ## 4. TLS in front
 
@@ -112,8 +146,35 @@ sudo systemctl reload caddy
 ### nginx
 
 Use `deploy/nginx.conf.example` and run `certbot --nginx -d API_DOMAIN`. Keep
-its `client_max_body_size` and the long `proxy_read_timeout` — a transcription
-request stays open for minutes.
+its `client_max_body_size` — a whole recording is uploaded as one body.
+
+### Cloudflare Tunnel (when inbound ports are closed)
+
+A host whose firewall only allows SSH needs no certificate and no open port: a
+`cloudflared` tunnel dials out, and Cloudflare terminates TLS at its edge. Add
+a public hostname to the tunnel pointing at `http://127.0.0.1:8787` — Zero
+Trust → Networks → Tunnels → *tunnel* → Public Hostname, or via the API:
+
+```bash
+curl -X PUT \
+  "https://api.cloudflare.com/client/v4/accounts/$ACCOUNT_ID/cfd_tunnel/$TUNNEL_ID/configurations" \
+  -H "Authorization: Bearer $CLOUDFLARE_API_TOKEN" -H 'Content-Type: application/json' \
+  -d '{"config":{"ingress":[
+        {"hostname":"API_DOMAIN","service":"http://127.0.0.1:8787"},
+        {"service":"http_status:404"}]}}'
+```
+
+Send the tunnel's *whole* ingress list, including any hostnames it already
+serves: the PUT replaces the config rather than merging into it. `API_DOMAIN`
+then needs a proxied `CNAME` to `$TUNNEL_ID.cfargotunnel.com`, replacing any
+existing record for that name.
+
+Two edge limits apply on this path and not on the two above: the Free plan
+rejects a request body over 100 MB, and a response must start within 100
+seconds. Neither binds here — the frontend encodes audio at 32 kbps mono
+(~29 MB for a two-hour meeting) and `/transcribe` answers `202` immediately
+while the job runs in the background — but a higher upload bitrate would push
+past the first one.
 
 ## 5. Verify the backend before touching the frontend
 
@@ -165,6 +226,11 @@ Two consequences worth knowing before the switch:
 docker compose logs -f              # what the pipeline is doing
 docker compose restart              # after an .env change
 docker compose pull && docker compose up -d --build   # after a git pull
+
+# Native install: the same three, under systemd
+journalctl -u meetutu-backend -f
+systemctl restart meetutu-backend
+git pull && pnpm install --frozen-lockfile && pnpm build && systemctl restart meetutu-backend
 
 # Backup: everything durable is DATA_DIR (meetutu.db + audio/)
 docker run --rm -v meetutu-data:/data -v "$PWD":/backup alpine \
