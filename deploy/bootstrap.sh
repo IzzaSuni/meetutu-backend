@@ -42,6 +42,29 @@ require_debian() {
   command -v apt-get >/dev/null || die "this script expects Debian or Ubuntu (no apt-get found)"
 }
 
+# Plenty of cheap VPSes are LXC/OpenVZ containers where systemd is installed but
+# is not PID 1, and there `systemctl enable --now` refuses with "--now cannot be
+# used when systemd is not running".
+if [ -d /run/systemd/system ]; then
+  HAS_SYSTEMD=1
+else
+  HAS_SYSTEMD=0
+fi
+
+# Enables a service at boot and starts it now, on either init system.
+start_service() {
+  local name="$1"
+
+  if [ "$HAS_SYSTEMD" -eq 1 ]; then
+    $SUDO systemctl enable --now "$name"
+    return
+  fi
+
+  [ -x "/etc/init.d/$name" ] || return 1
+  $SUDO update-rc.d "$name" defaults >/dev/null 2>&1 || true
+  $SUDO service "$name" start || $SUDO "/etc/init.d/$name" start
+}
+
 # Prompts for a value only when the environment did not supply one. The second
 # argument hides the input, for anything that should not land in the scrollback
 # or the shell history.
@@ -96,9 +119,26 @@ check_dns() {
   fi
 }
 
+ensure_docker_running() {
+  $SUDO docker info >/dev/null 2>&1 && return
+
+  [ "$HAS_SYSTEMD" -eq 1 ] || warn "systemd is not running on this host (a container VPS?) — using SysV init"
+  start_service docker ||
+    die "the Docker daemon is not running and could not be started.
+       On a container VPS without systemd, start it with: $SUDO dockerd >/var/log/dockerd.log 2>&1 &"
+
+  local attempt
+  for attempt in $(seq 1 10); do
+    $SUDO docker info >/dev/null 2>&1 && return
+    sleep 2
+  done
+  die "the Docker daemon did not come up — check /var/log/docker.log or 'dockerd' output"
+}
+
 install_docker() {
   if command -v docker >/dev/null && docker compose version >/dev/null 2>&1; then
     echo "Docker with the compose plugin is already installed"
+    ensure_docker_running
     return
   fi
 
@@ -113,7 +153,7 @@ install_docker() {
     $SUDO tee /etc/apt/sources.list.d/docker.list >/dev/null
   $SUDO apt-get update -qq
   $SUDO apt-get install -y -qq docker-ce docker-ce-cli containerd.io docker-buildx-plugin docker-compose-plugin
-  $SUDO systemctl enable --now docker
+  ensure_docker_running
 }
 
 # Names the process already listening on :443, empty if nothing is. A VPS that
@@ -220,12 +260,26 @@ EOF
     printf '%s\n' "$SITE_IMPORT" | $SUDO tee "$CADDYFILE" >/dev/null
   fi
 
-  $SUDO systemctl enable --now caddy
-  # validate before reload: a broken config would otherwise drop every site on
-  # this host, not just ours.
+  # Validate before (re)loading: a broken config would otherwise drop every site
+  # on this host, not just ours.
   $SUDO caddy validate --config "$CADDYFILE" --adapter caddyfile >/dev/null ||
     die "the Caddy config does not validate — nothing was reloaded, check $CADDYFILE"
-  $SUDO systemctl reload caddy
+
+  if [ "$HAS_SYSTEMD" -eq 1 ]; then
+    $SUDO systemctl enable --now caddy
+    $SUDO systemctl reload caddy
+    return
+  fi
+
+  # The Debian package ships only a systemd unit, so without systemd we drive
+  # Caddy's own background daemon instead.
+  if $SUDO caddy reload --config "$CADDYFILE" --adapter caddyfile 2>/dev/null; then
+    echo "Reloaded the running Caddy"
+  else
+    $SUDO caddy start --config "$CADDYFILE" --adapter caddyfile
+  fi
+  warn "no systemd here, so Caddy will not come back after a reboot. Persist it with:
+       (crontab -l 2>/dev/null; echo '@reboot caddy start --config $CADDYFILE --adapter caddyfile') | crontab -"
 }
 
 verify() {
