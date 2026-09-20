@@ -188,6 +188,10 @@ signed-in frontend keeps working after the cutover.
 
 ## Deploying to a VPS
 
+For the full sequence — DNS, TLS, CORS, verification, and pointing the
+Cloudflare-hosted frontend at this server — follow [deploy/RUNBOOK.md](deploy/RUNBOOK.md).
+The sections below are the short form.
+
 1 GB RAM / 1 vCPU is enough: Node idles around 100 MB, streaming upload peaks
 add tens of MB, and the work is I/O-bound (audio is already encoded to MP3 in
 the browser, so there is no server-side transcoding).
