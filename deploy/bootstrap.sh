@@ -119,20 +119,51 @@ check_dns() {
   fi
 }
 
+DOCKERD_LOG="/var/log/dockerd.log"
+
+# Waits for the daemon to accept connections. Starting it returns long before
+# the socket is ready.
+docker_ready() {
+  local attempt
+  for attempt in $(seq 1 "${1:-10}"); do
+    $SUDO docker info >/dev/null 2>&1 && return 0
+    sleep 2
+  done
+  return 1
+}
+
+# Last resort when the init script will not work: run the daemon directly.
+# Containers commonly reject the `ulimit` the SysV script sets, and they just as
+# commonly cannot use overlay2, so a vfs retry follows if the log says so.
+start_dockerd_directly() {
+  command -v dockerd >/dev/null || return 1
+
+  warn "starting dockerd directly, logging to $DOCKERD_LOG"
+  $SUDO sh -c "nohup dockerd >>'$DOCKERD_LOG' 2>&1 &"
+  docker_ready 10 && return 0
+
+  if $SUDO grep -qiE 'overlay|storage.driver|failed to mount' "$DOCKERD_LOG" 2>/dev/null; then
+    warn "overlay2 is unavailable in this container — retrying with the vfs storage driver (slower, more disk)"
+    $SUDO sh -c "nohup dockerd --storage-driver=vfs >>'$DOCKERD_LOG' 2>&1 &"
+    docker_ready 10 && return 0
+  fi
+
+  return 1
+}
+
 ensure_docker_running() {
   $SUDO docker info >/dev/null 2>&1 && return
 
   [ "$HAS_SYSTEMD" -eq 1 ] || warn "systemd is not running on this host (a container VPS?) — using SysV init"
-  start_service docker ||
-    die "the Docker daemon is not running and could not be started.
-       On a container VPS without systemd, start it with: $SUDO dockerd >/var/log/dockerd.log 2>&1 &"
 
-  local attempt
-  for attempt in $(seq 1 10); do
-    $SUDO docker info >/dev/null 2>&1 && return
-    sleep 2
-  done
-  die "the Docker daemon did not come up — check /var/log/docker.log or 'dockerd' output"
+  if start_service docker && docker_ready 10; then
+    return
+  fi
+
+  start_dockerd_directly && return
+
+  $SUDO tail -n 15 "$DOCKERD_LOG" 2>/dev/null || true
+  die "the Docker daemon would not start; the last lines of $DOCKERD_LOG are above"
 }
 
 install_docker() {
@@ -278,8 +309,11 @@ EOF
   else
     $SUDO caddy start --config "$CADDYFILE" --adapter caddyfile
   fi
-  warn "no systemd here, so Caddy will not come back after a reboot. Persist it with:
-       (crontab -l 2>/dev/null; echo '@reboot caddy start --config $CADDYFILE --adapter caddyfile') | crontab -"
+  warn "no systemd here, so neither Caddy nor the Docker daemon survives a reboot. Persist both with:
+       (crontab -l 2>/dev/null
+        echo '@reboot dockerd >>$DOCKERD_LOG 2>&1 &'
+        echo '@reboot caddy start --config $CADDYFILE --adapter caddyfile') | crontab -
+       The container itself restarts on its own once dockerd is back."
 }
 
 verify() {
